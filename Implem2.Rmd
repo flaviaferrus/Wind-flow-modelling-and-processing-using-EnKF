@@ -1,0 +1,2390 @@
+---
+title: 'Implementing the Ensemble Kalman Filter (EnKF)'
+author: "Flavia Ferrus Marimon"
+#abstract: "L'objectiu d'aquest treball és introduir el concepte de Distància de Mahalanobis. El treball consta d'una breu introducció històrica, seguida d'una visió més teòrica sobre la distància de Mahalanobis que inclourà tant definicions bàsiques com teoremes i propietats de la distància. Finalment, es presentaran algunes de les seves múltiples aplicacions, il·lustrades amb un exemple pràctic final. "
+date: '`r format(Sys.time(), "%B %d, %Y")`'
+output:
+  pdf_document: 
+    fig_caption: true
+    number_sections: true
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+```{=tex}
+\tableofcontents
+\newpage
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,eval=T,include=T,message = FALSE,warning=FALSE)
+```
+
+```{r include=FALSE}
+library(dlm)
+library(forecast)
+library(ggplot2)
+library(zoo)
+library(stats)
+library(readr)
+library(lmtest)
+```
+
+\section{Experimental data}
+
+In this research the Ensemble Kalman Filter (EnKF) is implemented over a fluid system describing a wind flow along a round pipe. The Data Assimilation method is computed using the experimental data collected simultaneously for three different measurement points: the initial point (E) and two experimental points positioned on the middle of the round pipe at different $x$ positions (A and C).
+
+```{r include=FALSE}
+#Experimental data
+X2022_03_10_17_20_36 <- read_csv("2022-03-14-15-41-21.csv")
+CE <- X2022_03_10_17_20_36[ 60: 240, ]
+CE <- cbind( CE$`657 [m/s]`, CE$`076 [m/s]`)
+colnames(CE) <- c("velE", "velC")
+CE <- as.data.frame(CE)
+x <- index(CE)
+g.dlm <- ggplot(data =CE, aes(x= x, y= as.numeric(velE))) + geom_line(color= "navy")+
+  geom_line(aes( y=as.numeric(velC)), color = "coral")
+g.dlm
+velC <- as.numeric(CE$velC)
+velE <- as.numeric(CE$velE)
+#mean(velC) #0.968232
+#mean(velE) #1.881989
+
+#ts.plot(velC)
+#ts.plot(velE)
+auto.arima(velE)  # WN !! :)
+auto.arima(velC)  # WN !! :)
+```
+
+```{r include=FALSE}
+X2022_03_10_17_20_36 <- read_csv("2022-03-14-15-27-49.csv")
+AE <- X2022_03_10_17_20_36[ 120: 300, ]
+AE <- cbind( AE$`657 [m/s]`, AE$`076 [m/s]`)
+colnames(AE) <- c("velE", "velA")
+AE <- as.data.frame(AE)
+x <- index(AE)
+g.dlm <- ggplot(data =AE, aes(x= x, y= as.numeric(velE)), color= "navy") + geom_line()+
+  geom_line(aes( y=as.numeric(velA)), color = "coral")
+g.dlm
+velA <- as.numeric(AE$velA)
+auto.arima(velA)
+
+exp <- as.data.frame(cbind(c(1, 57, 133), c(velE[120], velA[120], velC[120])))
+```
+
+\section{Simulated data}
+
+Using the COMSOL Multiphysics environment, different simulations taking various assumptions are implemented in order to model the system and provide theoretical data necessary to update the Ensemble Kalman Filter data assimilation method and improve the filtered values.
+
+\subsection{Longitudinal profile}
+
+The longitudinal data sets for t=3 min are used as new observations on the update step for the EnKF as a Data Assimilation method.
+
+The Laminar flow simulation has been implemented for different diameter values, since the experimental one produced a solution with greater magnitude than the experimental values. This could be explained by the pipe's losses and wall friction forces, considered more negligent in the laminar simulated case. The corresponding profiles are represented on figure \ref{fig:fig1}.
+
+Additional data sets are generated using the Turbulent Flow environment, considering the possibility of having high enough Reynolds number causing disturbances on the wind flow that evolve to a chaotic and more turbulent flow, further from the laminar expected flow. However, the convergence of the system gets more complex as the inertial terms need to be in consideration when solving the governing equations. Therefore, to ease the system's convergence, it is needed to study the stationary solution of the system, using the experimental boundary condition (as aforementioned in the Laminar flow simulations). The stationary solution is used as the initial condition for the time dependent case, turning out in a turbulent transient system depending on time.
+
+The Turbulent Transient system is similarly studied for different diameter values, distributed around the experimental value. However, in this case the we focus on the experimental setup, using the corresponding fixed diameter. Even so, note that there are perturbations due to small interference on the mesh, causing a shift of the velocity distribution over the cross-sectional arc-length, depending on the inlet's diameter. Therefore, different axis have been considered over the longitudinal position so a more accurate/realistic distribution can be obtained from the assymetrical simulated data. The corresponding data sets for different x axis are illustrated in figure \ref{fig:fig1}.
+
+```{r include=FALSE}
+DataL <- read.csv("Long Laminar  - Full 1.csv", dec=",", header=TRUE, stringsAsFactors=FALSE)
+Laminar <- as.data.frame(cbind(DataL$X.2[3:153]*10^(-16), DataL$X.5[3:153]*10^(-16)) )
+colnames(Laminar) <- c("vel04", "vel035")
+DataL <- read.csv("Dades longitudinals - Full 1.csv", dec=",", header=TRUE, stringsAsFactors=FALSE)
+VelL <- as.data.frame(DataL$X.3*10^(-16))
+colnames(VelL) <- "vel"
+
+DataL <- read.csv("Dades longitudinals - Full 1.csv", dec=",", header=TRUE, stringsAsFactors=FALSE)
+VelL <- as.data.frame(DataL$X.3*10^(-16))
+colnames(VelL) <- "vel"
+DataL <- read.csv("Long Turbulent 045 - Full 1.csv", dec=",", header=TRUE, stringsAsFactors=FALSE)
+Turbulent045 <- as.data.frame(DataL$X.3*10^(-16))
+colnames(Turbulent045) <- "vel"
+Turbulents <- as.data.frame(cbind(VelL, Turbulent045$vel[2:152]))
+colnames(Turbulents) <- c("vel04", "vel045")
+```
+
+```{r include=FALSE}
+## Longitudinal velocity prfile over y=0.05m axis, for 0.0399m and 0.04m diameter
+DataL <- read.csv("Dif diametresT - Full 1.csv", dec=",", header=TRUE, stringsAsFactors=FALSE)
+#velT <- as.data.frame(DataL$X.5[2:152])
+velT <- as.data.frame(DataL$X.6[2:152]*10^(-16))
+colnames(velT) <- "LongT"
+## results are almost equivalents
+
+LongDiam <- read.csv("LongDiam - Full 1.csv", dec=",", header=TRUE, stringsAsFactors=FALSE)
+LD <- as.data.frame(cbind(LongDiam$X.2[3:153], LongDiam$X.4[3:153], LongDiam$X.6[3:153], LongDiam$X.8[3:153], LongDiam$X.10[3:153], LongDiam$X.12[3:153], LongDiam$X.14[3:153]))
+colnames(LD) <- c("vel039904", "vel039906", "vel0399", "vel0399035", "vel0406", "vel04065", "vel04")
+
+mm <- as.data.frame(cbind((LD$vel04065+LD$vel04)/2, (LD$vel04+ Turbulents$vel045)/2, ((LD$vel04065+LD$vel04)/2 + Turbulents$vel045)/2 ))
+colnames(mm) <- c("mitjana1", "mitjana045", "mitjanaX2")
+
+mmL <- as.data.frame((Laminar$vel04 + Laminar$vel035)/2)
+colnames(mmL) <- "mitjana"
+
+```
+
+Laminar simulated velocity.
+
+```{r include=FALSE}
+LLdata <- read.csv("Puntuals 180s - Full 2.csv", dec=",", header=TRUE, stringsAsFactors=FALSE)
+LL <- as.data.frame(cbind(LLdata$X.1[2:152], LLdata$X.3[2:152], LLdata$X.5[2:152]))
+colnames(LL) <- c("vel04", "vel036", "vel037")
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig1}Flow's velocity longitudinal profiles.")}
+LongD2 <- data.frame(x = index(LD$vel039904), 
+                              values= c(#LD$vel04065, 
+                                        LD$vel04,
+                                        #mm$mitjana1,
+                                        #Laminar$vel04, 
+                                        #Laminar$vel035, 
+                                        mmL$mitjana,
+                                        mm$mitjana045, 
+                                        #mm$mitjanaX2
+                                        #Turbulents$vel045
+                                        LL$vel04,
+                                        LL$vel036,
+                                        LL$vel037
+                                        ), 
+                              Data= c(#rep("Turbulent flow, y=0.065", 151),
+                                      rep("Turbulent flow", 151),
+                                      #rep("Turbulent flow mean", 151),
+                                      rep("Laminar flow mean", 151),
+                                      #rep("Laminar flow 0.35m", 151),
+                                      #rep("Laminar flow mean", 151),
+                                      rep("Turbulent flow mean", 151),
+                                      #rep("Turbulent flow mean 0.045 2", 151),
+                                      rep("Laminar flow", 151), 
+                                      rep("Laminar flow 0.036", 151),
+                                      rep("Laminar flow 0.037", 151)
+                                      ))
+ggplot(LongD2, aes(x, values, col= Data))+geom_line(size=0.5)+
+  #scale_color_manual(values= c("darkred", "coral", "orange", "navy", "turquoise")) +
+  scale_color_manual(values= c("coral", "red", "orange", "darkred", "navy", "turquoise")) +
+  geom_point(data= exp, aes(x = V1, y=V2), color= "deeppink")+
+  #theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Simulated longitudinal flow velocity") + xlab("x (m)") + ylab("Velocity (m/s)")
+```
+
+The closer to the experimental configuration is the laminar distribution for 0.04m diameter inlet. However, the distribution that adjust more precisely the experimental observations corresponds to the boundary condition fixed to 0.036m (if needed a study over this distribution could provide accurate results, given the possible experimental losses and wall friction forces).
+
+The mean distribution corresponds to the distribution for 0.037m so we could use this punctual data in order to study a more realistic distribution.
+
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig1}Flow's velocity longitudinal profiles.")}
+LongD22 <- data.frame(x = index(LD$vel039904), 
+                              values= c(#LD$vel04065, 
+                                        LD$vel04,
+                                        #mm$mitjana1,
+                                        #Laminar$vel04, 
+                                        #Laminar$vel035, 
+                                        #mmL$mitjana,
+                                        mm$mitjana045, 
+                                        #mm$mitjanaX2
+                                        #Turbulents$vel045
+                                        #LL$vel04,
+                                        #LL$vel036,
+                                        LL$vel037
+                                        ), 
+                              Data= c(#rep("Turbulent flow, y=0.065", 151),
+                                      rep("Turbulent flow", 151),
+                                      #rep("Turbulent flow mean", 151),
+                                      #rep("Laminar flow mean", 151),
+                                      #rep("Laminar flow 0.35m", 151),
+                                      #rep("Laminar flow mean", 151),
+                                      rep("Turbulent flow mean", 151),
+                                      #rep("Turbulent flow mean 0.045 2", 151),
+                                      #rep("Laminar flow", 151), 
+                                      #rep("Laminar flow 0.036", 151),
+                                      rep("Laminar flow", 151)
+                                      ))
+ggplot(LongD22, aes(x, values, col= Data))+geom_line(size=0.5)+
+  #scale_color_manual(values= c("darkred", "coral", "orange", "navy", "turquoise")) +
+  scale_color_manual(values= c("coral", "navy", "turquoise")) +
+  geom_point(data= exp, aes(x = V1, y=V2), color= "deeppink")+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Simulated longitudinal flow velocity") + 
+  xlab("x (m)") + ylab("Velocity (m/s)")
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig1}Flow's velocity longitudinal profiles.")}
+LongD22 <- data.frame(x = index(LD$vel039904), 
+                              values= c(#LD$vel04065, 
+                                        LD$vel04,
+                                        #mm$mitjana1,
+                                        #Laminar$vel04, 
+                                        #Laminar$vel035, 
+                                        #mmL$mitjana,
+                                        mm$mitjana045, 
+                                        #mm$mitjanaX2
+                                        #Turbulents$vel045
+                                        #LL$vel04,
+                                        #LL$vel036,
+                                        LL$vel037
+                                        ), 
+                              Data= c(#rep("Turbulent flow, y=0.065", 151),
+                                      rep("Turbulent flow", 151),
+                                      #rep("Turbulent flow mean", 151),
+                                      #rep("Laminar flow mean", 151),
+                                      #rep("Laminar flow 0.35m", 151),
+                                      #rep("Laminar flow mean", 151),
+                                      rep("Turbulent flow mean", 151),
+                                      #rep("Turbulent flow mean 0.045 2", 151),
+                                      #rep("Laminar flow", 151), 
+                                      #rep("Laminar flow 0.036", 151),
+                                      rep("Laminar flow", 151)
+                                      ))
+ggplot(LongD22, aes(x, values, col= Data))+geom_line(size=0.5)+
+  #scale_color_manual(values= c("darkred", "coral", "orange", "navy", "turquoise")) +
+  scale_color_manual(values= c("coral", "navy", "turquoise")) +
+  geom_point(data= exp, aes(x = V1, y=V2), color= "deeppink")+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Simulated longitudinal flow velocity") + 
+  xlab("x (m)") + ylab("Velocity (m/s)")+
+  ylim(0, 2)
+```
+
+```{r include=FALSE}
+## Reynolds number of the experimental setup
+mean(velE)
+mean(velA)
+mean(velC)
+
+X2022_03_10_17_20_36 <- read_csv("2022-03-14-15-41-21.csv")
+CE <- X2022_03_10_17_20_36[ 60: 240, ]
+CE
+## Temperatura de l'aire quan prenent les mesures és 23.5 per al punt C i 23.3 per al punt E
+##
+1.8348E-5/1.1925
+Vavg <- (mean(velA)+ mean(velC))/2
+nu <- 1.5387*10^(-5)
+Re <- Vavg*0.1/nu
+Re
+Unu <- 10^(-8)
+Uv <- 0.002
+Ul <- 0.001
+Ure <- sqrt((Uv*0.1/nu)^2 + (Ul*Vavg/nu)^2 + ( Unu*Vavg*0.1/nu^2)^2)
+Ure
+
+fric <- 1/(-1.8*log(6.9/Re))^2
+fric
+
+Ufric <- 2*Ure/(1.8^2 * (log(6.9/Re))^4 * Re)
+Ufric
+
+fr <- 64/Re
+Ufr <- Ure/Re^2
+fr
+Ufr
+```
+
+\subsection{Punctual distributions over time}
+
+The simulated punctual data over time used to implement the KF and the EnKF corresponds to the data passed a time interval of 3 minutes in order to have at least the first minute as a transient interval and a 2 minute interval of more steady data corresponding to the experimental time interval used. We may use the punctual data for the closer configurations to the real system. Therefore, the punctual distributions for the laminar and turbulent flow mean velocity are showed in figure \ref{fig:fig2}, along with the experimental punctual observations.
+
+```{r include=FALSE}
+PTdata <- read.csv("Puntuals 180s - Full 1.csv", dec=",", header=TRUE, stringsAsFactors=FALSE)
+PT <- as.data.frame(cbind(PTdata$X.1[4:362]*10^(-16), PTdata$X.3[4:362]*10^(-16), PTdata$X.5[4:362]*10^(-16), PTdata$X.7[4:362]*10^(-16)))
+colnames(PT) <- c("velA05", "velC05", "velC06", "velA06")
+row_odd <- seq_len(nrow(PT)) %% 2              # Create row indicator
+row_odd  
+PTu <- as.data.frame(PT[row_odd == 0, ] ) 
+
+mmA <- as.data.frame((PTu$velA05+ PTu$velA06)/2)
+colnames(mmA) <- "mitjana"
+
+## Laminar
+
+PLdata <- read.csv("Puntuals 180s - Full 3.csv", dec=",", header=TRUE, stringsAsFactors=FALSE)
+PL <- as.data.frame(cbind(PLdata$X[2:359], PLdata$X.2[2:359]))
+colnames(PL) <- c("velA037", "velC037")
+row_odd <- seq_len(nrow(PL)) %% 2              # Create row indicator
+row_odd  
+PLa <- as.data.frame(PL[row_odd == 0, ] ) 
+
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig2}Punctual velocity distributions over time for different simulated models.")}
+Laminar03Filter <- data.frame(x = index(velA[60:179]), 
+                              values= c(velA[59:178], velC[59:178],
+                                        #PTu$velA05[59:178], 
+                                        PTu$velC05[59:178],
+                                        #PTu$velC06[59:178],
+                                        #PTu$velA06[59:178],
+                                        mmA$mitjana[59:178],
+                                        PLa$velA037[59:178],
+                                        PLa$velC037[59:178]
+                                        ),
+                                        
+                              Data= c(rep("True velocity B", 120), 
+                                 rep( "True velocity D",120), 
+                                 #rep("Simulated velocity B Turbulent", 120),
+                                 rep("Simulated velocity D Turbulent", 120),
+                                 #rep("Simulated velocity B Laminar 0.04", 120),
+                                 #rep("Simulated velocity D Laminar 0.04", 120), 
+                                 #rep("Simulated velocity D Turbulent shifted", 120),
+                                 #rep("Simulated velocity B Turbulent shifted", 120),
+                                 #rep("Simulated velocity B Turbulent mean", 120),
+                                 rep("Simulated velocity B Turbulent", 120),
+                                 rep("Simulated velocity B Laminar", 120),
+                                 rep("Simulated velocity D Laminar", 120)))
+ggplot(Laminar03Filter, aes(x, values, col= Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c("turquoise"," blue", "red",  "coral", "navy", "darkred")) +
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Simulated punctual velocity profile over time") + 
+  xlab("t (s)") + ylab("Velocity (m/s)")
+
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig2}Punctual velocity distributions over time for different simulated models.")}
+Laminar03Filter <- data.frame(x = index(velA[60:179]), 
+                              values= c(velA[59:178], velC[59:178],
+                                        #PTu$velA05[59:178], 
+                                        PTu$velC05[59:178],
+                                        #PTu$velC06[59:178],
+                                        #PTu$velA06[59:178],
+                                        mmA$mitjana[59:178],
+                                        PLa$velA037[59:178],
+                                        PLa$velC037[59:178]
+                                        ),
+                                        
+                              Data= c(rep("True velocity B", 120), 
+                                 rep( "True velocity D",120), 
+                                 #rep("Simulated velocity B Turbulent", 120),
+                                 rep("D Turbulent", 120),
+                                 #rep("Simulated velocity B Laminar 0.04", 120),
+                                 #rep("Simulated velocity D Laminar 0.04", 120), 
+                                 #rep("Simulated velocity D Turbulent shifted", 120),
+                                 #rep("Simulated velocity B Turbulent shifted", 120),
+                                 #rep("Simulated velocity B Turbulent mean", 120),
+                                 rep("B Turbulent", 120),
+                                 rep("B Laminar", 120),
+                                 rep("D Laminar", 120)))
+ggplot(Laminar03Filter, aes(x, values, col= Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c("turquoise"," blue", "red",  "coral", "navy", "darkred")) +
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Simulated punctual velocity profile over time") + 
+  xlab("t (s)") + ylab("Velocity (m/s)")
+
+```
+
+Note that the simulated values remain lower than real distribution this time. However, this is caused by the asymmetry of the system's solution. Therefore, the data used for the KF is the obtained computing the mean between the different y axis.
+
+\section{Kalman Filter}
+
+\subsection{Laminar flow}
+
+```{r include=FALSE}
+auto.arima(PLa$velA037) ## ARIMA(2,2,0) 
+## log likelihood=1005.15
+m1 <- arima(PLa$velA037, order=c(2,0,0), include.mean = TRUE)
+m1
+## log likelihood = 986.82
+
+m3 <- arima(PLa$velA037, order=c(2,2,0), include.mean = FALSE)
+m3
+## ARIMA(2,2,0) no intercept log likelihood = 999.27
+
+m4 <- arima(PLa$velA037, order=c(3,0,0), include.mean = TRUE)
+m4
+## log likelihood = 1005.9 (no mean? 1.0087 pm 4.0947 ?? ) 
+
+m2 <- arima(PLa$velA037, order=c(2,1,0), include.mean = TRUE)
+m2
+## no intercept log likelihood = 1000.34
+
+p1 <- 1.5606
+p2 <- -0.5620
+m1.dlm <- dlmModARMA( ar= c(p1+1,p2-p1, -p2))
+m1.dlm
+model.filteredAL <- dlmFilter(velA, m1.dlm)
+model.filteredAL$f[4:181]
+
+
+## C
+auto.arima(PLa$velC037) ## ARIMA(1,2,1) 
+# log likelihood=991.84
+mm1 <- arima(PLa$velC037, order=c(2,1,0), include.mean = TRUE)
+mm1
+## c(1,0,1) log likelihood = 779.06
+## c(1,1,0) no mean  log likelihood = 972.49
+## c(2,1,0) log likelihood = 990.78
+
+p1 <- 1.5959
+p2 <- -0.5974
+m2.dlm <- dlmModARMA( ar= c(p1+1,p2-p1, -p2))
+m2.dlm
+model.filteredCL <- dlmFilter(velC, m2.dlm)
+model.filteredCL$f[4:181]
+
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig3.2}Experimental and simulated flow velocity for the measurement points over time and filtered data using the Kalman Filter with the simulated data set update. Simulated data for the configuration of laminar flow with 0.04m diameter. ")}
+LaminarFilter  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velA[58:177],model.filteredCL$f[59:178], velC[58:177], 
+                                             model.filteredAL$f[59:178],
+                                             PLa$velA037[58:177], PLa$velC037[58:177]
+                                             ), 
+                        Data = c(rep("True velocity A", 120), 
+                                 rep( "Filtered State C ARIMA(2,1,0)", 120),
+                                 rep( "True velocity C",120), 
+                                 rep( "Filtered State A ARIMA(2,1,0)", 120),
+                                 rep("Simulated velocity A", 120), 
+                                 rep("Simulated velocity C", 120)) )
+ggplot(LaminarFilter, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "blue", "coral", "deepskyblue","red", "navy", "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dotdash", "solid","solid", "solid","solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Observed, simulated and filtered punctual velocity") + 
+  xlab("Time (s)") + ylab("Velocity (m/s)")
+
+```
+
+
+
+```{r include=FALSE}
+
+#### C
+plot(index(velC[60:179]), model.filteredCL$f[59:178] , col="darkturquoise", type="l", lty="dashed", xlab="Time (s)", ylab="Velocity (m/s)", main="KF B turbulent velocity")
+lines(index(velC[60:179]), velC[58:177],  col="navy", type="l")
+lines(index(velC[60:179]), PLa$velC037[58:177],  col="coral", type="l")
+legend("topleft", lty=c(1, 2),
+       col=c("navy" , "darkturquoise"),
+       legend=c("true state", "filtered state"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+##error plot 
+#difference between the true and the measured position
+#and the difference between the true position and the filtered position estimate
+
+plot(index(velA[60:179]), (PLa$velC037[59:178]- velC[58:177])^2, col=gray(level=.7), 
+     type="l", xlab="Time (s)", ylab="Velocity error (m/s)", main="Mean squared error")
+lines(index(velA[60:179]), ( model.filteredAL$f[59:178]-velA[58:177])^2, col=gray(level=.2))
+abline(h=0, col="blue", lty=2)
+legend("topright", lty=c(1, 2),
+       col=c(gray(level=.7), col=gray(level=.2), "blue"),
+       legend=c("true state - simulated", "true state - filtered state"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+plot(index(velA[60:179]),  ( model.filteredCL$f[59:178]-velC[58:177])^2 , col=gray(level=.7), 
+     type="l", xlab="Time (s)", ylab="Velocity error (m/s)", main="Mean squared error")
+lines(index(velA[60:179]), (PLa$velC037[59:178]- velC[58:177])^2, col=gray(level=.2))
+abline(h=0, col="blue", lty=2)
+legend("topright", lty=c(1, 2),
+       col=c(gray(level=.7), col=gray(level=.2), "blue"),
+       legend=c( "true state - filtered state", "true state - simulated" ),
+       bty="n", y.intersp=1.2, cex=.7)
+
+## meh bastant same els dos
+```
+
+```{r include=FALSE}
+meanA <- mean(PLa$velA037)
+auto.arima(PLa$velA037- meanA)
+## ARIMA(5,2,0) log likelihood=1005.13
+
+mA1 <- arima(PLa$velA037- meanA, order=c(3,0,0), include.mean = FALSE)
+mA1
+## log likelihood = 1005.91
+
+p1 <- 2.5608
+p2 <- -2.1231
+p3 <- 0.5623
+mA1.dlm <- dlmModARMA( ar= c(p1,p2, p3))
+mA1.dlm
+#model.filteredAL1 <- dlmFilter(velA-mean(velA), mA1.dlm)
+model.filteredAL1 <- dlmFilter(velA, mA1.dlm)
+model.filteredAL1$f[4:181]
+#model.filteredAL.wexp <- model.filteredAL1$f[4:181] + mean(velA)
+#model.filteredAL.wsim <- model.filteredAL1$f[4:181] + meanA
+
+meanC <- mean(PLa$velC037)
+auto.arima(PLa$velC037- meanC)
+## ARIMA(1,2,1) log likelihood=991.81
+
+mC1 <- arima(PLa$velC037- meanC, order=c(2,1,0), include.mean = TRUE)
+mC1
+## log likelihood = 990.73
+mC1 <- arima(PLa$velC037- meanC, order=c(3,0,1), include.mean = FALSE)
+mC1
+## 998.91
+
+p1 <- 2.9559
+p2 <- -2.9126
+p3 <- 0.9567
+ma1 <- -0.5664
+mC.dlm <- dlmModARMA( ar= c(p1,p2, p3), ma=ma1)
+mC.dlm
+model.filteredCL1 <- dlmFilter(velC, mC.dlm)
+model.filteredCL1$f[4:181]
+model.filteredCL.wexp <- model.filteredCL1$f[4:181] + mean(velC)
+model.filteredCL.wsim <- model.filteredCL1$f[4:181] + meanC
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig3.3}Experimental and simulated flow velocity for the measurement points over time and filtered data using the Kalman Filter with the simulated data set update. Experimental configuration with diameter of 0.04m, and simulated data for the configuration of laminar flow with 0.04m diameter. ")}
+experimentalFilter  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velA[58:177], model.filteredAL1$f[59:178], velC[58:177], 
+                                             model.filteredCL$f[59:178],
+                                             model.filteredCL1$f[59:178],
+                                             #model.filteredCL.wsim[59:178],
+                                             #model.filteredCL.wexp[59:178],
+                                             #model.filteredAL.wexp[59:178],
+                                             PLa$velA037[58:177], PLa$velC037[58:177]
+                                             ), 
+                        Data = c(rep("True velocity A", 120), 
+                                 rep( "Filtered state A ARIMA(3,0,0)", 120),
+                                 rep( "True velocity C",120), 
+                                 rep( "Filtered State C ARIMA(2,1,0)", 120),
+                                 rep( "Filtered State C ARIMA(3,0,1)", 120),
+                                 #rep( "Filtered state A ARIMA(2,1,0) (shifted)", 120),
+                                 rep("Simulated velocity A", 120), 
+                                 rep("Simulated velocity C", 120)) )
+ggplot(experimentalFilter, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "deepskyblue","coral", "red", "blue", "violet",  "navy", "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dashed",  "dotdash","solid","solid", "solid","solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Observed, simulated and filtered punctual velocity") + 
+  xlab("Time (s)") + ylab("Velocity (m/s)")
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig3.3}Experimental and simulated flow velocity for the measurement points over time and filtered data using the Kalman Filter with the simulated data set update. Experimental configuration with diameter of 0.04m, and simulated data for the configuration of laminar flow with 0.04m diameter. ")}
+experimentalFilter  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velA[58:177], model.filteredAL1$f[59:178], velC[58:177], 
+                                             model.filteredCL$f[59:178],
+                                             model.filteredCL1$f[59:178],
+                                             #model.filteredCL.wsim[59:178],
+                                             #model.filteredCL.wexp[59:178],
+                                             #model.filteredAL.wexp[59:178],
+                                             PLa$velA037[58:177], PLa$velC037[58:177]
+                                             ), 
+                        Data = c(rep("True velocity B", 120), 
+                                 rep( "FS B ARIMA(3,0,0)", 120),
+                                 rep( "True velocity D",120), 
+                                 rep( "FS D ARIMA(2,1,0)", 120),
+                                 rep( "FS D ARIMA(3,0,1)", 120),
+                                 #rep( "Filtered state A ARIMA(2,1,0) (shifted)", 120),
+                                 rep("Simulated velocity B", 120), 
+                                 rep("Simulated velocity D", 120)) )
+ggplot(experimentalFilter, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "deepskyblue","coral", "pink", "blue", "deeppink",  "navy", "darkred")) +
+  scale_linetype_manual(values=c("solid","solid", "solid","dotdash",   "dotdash","dashed","dashed"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Observed, simulated and filtered punctual velocity") + 
+  xlab("Time (s)") + ylab("Velocity (m/s)")
+```
+
+```{r include=FALSE}
+
+#### A 
+## ARIMA(3,0,0) dona el mateix que ARIMA(2,1,0)
+
+mean(( model.filteredAL$f[59:178]-velA[58:177])^2) # 0.0006765584
+mean(( model.filteredAL1$f[59:178]-velA[58:177])^2) # 0.0006768531
+mean((PLa$velA037[59:178]- velA[58:177])^2) ## 0.0001393601
+
+## no millora xd
+
+
+### C
+plot(index(velA[60:179]), model.filteredCL$f[59:178] , col="darkturquoise", type="l", lty="dashed", xlab="Time (s)", ylab="Velocity (m/s)", main="KF B turbulent velocity")
+lines(index(velA[60:179]), velC[58:177],  col="navy", type="l")
+lines(index(velA[60:179]), model.filteredCL1$f[59:178],  col="coral", type="l",  lty="dotted")
+lines(index(velA[60:179]), PLa$velC037[58:177],  col="red", type="l")
+legend("topleft", lty=c(1, 2),
+       col=c("navy" , "darkturquoise"),
+       legend=c( "filtered state ARIMA(2,1,0)", "true state", "filtered state (ARIMA(3,0,1)", "simulated state"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+##error plot 
+#difference between the true and the measured position
+#and the difference between the true position and the filtered position estimate
+
+plot(index(velA[60:179]), (PLa$velA037[59:178]- velA[58:177])^2, col=gray(level=.7), 
+     type="l", xlab="Time (s)", ylab="Velocity error (m/s)", main="Mean squared error")
+lines(index(velA[60:179]), ( model.filteredAL$f[59:178]-velA[58:177])^2, col=gray(level=.2))
+abline(h=0, col="blue", lty=2)
+legend("topright", lty=c(1, 2),
+       col=c(gray(level=.7), col=gray(level=.2), "blue"),
+       legend=c("true state - simulated", "true state - filtered state"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+plot(index(velA[60:179]),  ( model.filteredCL$f[59:178]-velC[58:177])^2 , col=gray(level=.7), 
+     type="l", xlab="Time (s)", ylab="Velocity error (m/s)", main="Mean squared error")
+lines(index(velA[60:179]), (PLa$velC037[59:178]- velC[58:177])^2, col=gray(level=.2))
+lines(index(velA[60:179]), (model.filteredCL1$f[59:178]- velC[58:177])^2, col="turquoise")
+abline(h=0, col="blue", lty=2)
+legend("topright", lty=c(1, 1,1),
+       col=c(gray(level=.7), col=gray(level=.2), "turquoise"),
+       legend=c( "true state - filtered state 1", "true state - simulated", "true state - filtered state 2" ),
+       bty="n", y.intersp=1.2, cex=.7)
+
+## millor filtered ARIMA(3,0,1)
+mean(( model.filteredCL$f[59:178]-velC[58:177])^2) # 0.002804146
+mean(( model.filteredCL1$f[59:178]-velC[58:177])^2) # 0.001576669
+mean((PLa$velC037[59:178]- velC[58:177])^2) ## 0.003376758
+```
+
+\subsection{Turbulent flow}
+
+We may use the punctual distribution over time given by the mean for each point. Note that on point C (the further point from the wind flow generator) the simulated and experimental distributions are not gathered around the same mean. This can be taken into account when adjusting the corresponding state-space representation for each distribution.
+
+```{r include=FALSE}
+auto.arima(mmA$mitjana[59:178]) ## MA(2) with mean 
+## log likelihood=457.83
+mod1 <- arima(mmA$mitjana[59:178], order = c(2,0,0), include.mean = TRUE)
+mod1
+##log likelihood = 400.62
+auto.arima(PTu$velA05[59:178]) ## MA(2/1) with mean
+##log likelihood=397.52
+mod2 <- arima(PTu$velA05[59:178],  order = c(1,0,0), include.mean = TRUE)
+mod2
+## log likelihood = 397.54
+## AR(1): log likelihood = 390.97
+auto.arima(PTu$velC06[59:178]) ## MA(1) with mean
+## log likelihood=457.83
+mod3 <- arima(PTu$velC05[59:178],  order = c(2,0,0), include.mean = TRUE)
+mod3
+## log likelihood = 455.31
+## AR(1): log likelihood = 446.99
+```
+
+```{r include=FALSE}
+##MA(2) to shifted mean velA centered (afterwards we'll include the mean)
+## it is simply z_t = x_t - \mu
+
+model.build <- function(p){
+  return(dlmModARMA(ma = p))
+}
+auto.arima(mmA$mitjana[59:178])
+velA_mit <- mmA$mitjana[59:178] - 1.0566
+auto.arima(velA_mit)
+model.mleA <- dlmMLE(velA_mit, parm= c(0.8504, 0.2416), build = model.build)
+model.mleA
+#model.fitA <- model.build(model.mleA$par)
+model.fitA <- model.build(c(0.8504, 0.2416))
+model.fitA
+model.filteredA <- dlmFilter(velA-mean(velA), model.fitA)
+model.filteredA.wmean <- model.filteredA$f + 1.0566
+model.filteredA.wmean
+model.filteredA$f
+mean(velA)
+mean(model.filteredA.wmean)
+
+
+m1.dlm <- dlmModARMA( ma= c(0.8504, 0.2416))
+m1.dlm
+model.filteredA2 <- dlmFilter(velA, m1.dlm)
+model.filteredA2.wmean <- model.filteredA2$f+ 1.0566
+model.filteredA2.wmean
+## este no
+
+model.filteredA3 <- dlmFilter(velA-mean(velA), m1.dlm)
+model.filteredA3.wmean <- model.filteredA3$f+ 1.0566
+model.filteredA3.wmean
+mean(model.filteredA3.wmean)
+
+
+m2.dlm <- dlmModARMA( ar= c(0.8504, 0.2416))
+m2.dlm
+
+
+## velC
+
+## MA(1) to centered velC
+auto.arima(PTu$velC06[59:178])
+velC_mit <- PTu$velC06[59:178] - 0.8582
+#model.mleC <- dlmMLE(velC_mit, parm= 0.7850, build = model.build)
+#model.mleC
+#model.fitC <- model.build(model.mleC$par)
+model.fitC <- model.build(0.7850)
+model.fitC
+model.filteredC <- dlmFilter(velC, model.fitC)
+#model.filteredC.wmean <- model.filteredC$f + 0.8582
+#model.filteredC.wmean
+model.filteredC$f
+
+m3.dlm <- dlmModARMA( ma= 0.7850)
+m3.dlm
+model.filteredC2 <- dlmFilter(velC - mean(velC), m3.dlm)
+model.filteredC2.wmean <- model.filteredC2$f+ 0.8582
+model.filteredC2.wmean
+mean(model.filteredC2.wmean)
+
+## AR(2)
+
+m4.dlm <- dlmModARMA( ar= c(0.8807,-0.3596))
+m4.dlm
+model.filteredC3 <- dlmFilter(velC - mean(velC), m4.dlm)
+model.filteredC3.wmean <- model.filteredC3$f+ 0.8432
+model.filteredC3.wmean
+
+
+
+model.build2 <- function(p){
+  return(dlmModARMA(ar = p))
+}
+mod3 <- arima(PTu$velC05[59:178],  order = c(2,0,0), include.mean = TRUE)
+mod3
+velC_mit2 <- PTu$velC06[59:178] - 0.8432
+#model.mleC2 <- dlmMLE(velC_mit2, parm= c(0.8807,-0.3596), build = model.build2)
+#model.mleC2
+model.fitC2 <- model.build2(c(0.8807,-0.3596))
+model.fitC2
+
+model.filteredC2 <- dlmFilter(velC, model.fitC2)
+model.filteredC2$f
+
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig3}Experimental and simulated flow velocity for the measurement points over time and filtered data using the Kalman Filter with the simulated data set update. Experimental configuration with diameter of 0.04m, and simulated data for the configuration of turbulent flow with 0.04m diameter. ")}
+C3mean <-  model.filteredC3$f + mean(velC)
+A3mean <-  model.filteredA3$f + mean(velA)
+experimentalFilter  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velA[58:177], model.filteredA3.wmean[59:178], velC[58:177], 
+                                             model.filteredC3.wmean[59:178],
+                                             C3mean[59:178],
+                                             A3mean[59:178],
+                                             mmA$mitjana[59:178], PTu$velC06[59:178]), 
+                        Data = c(rep("True velocity A", 120), 
+                                 rep( "Filtered state A MA(2) w intercept", 120),
+                                 rep( "True velocity C",120), 
+                                 rep( "Filtered State C AR(2) w intercept", 120),
+                                 rep( "Filtered State C AR(2) w intercept (shifted)", 120),
+                                  rep( "Filtered state A MA(2) w intercept (shifted)", 120),
+                                 rep("Simulated velocity A", 120), 
+                                 rep("Simulated velocity C", 120)) )
+ggplot(experimentalFilter, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "deepskyblue","blue", "coral", "red", "violet", "darkgreen", "navy", "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dashed",  "dotdash","dashed","solid","solid", "solid","solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Observed, simulated and filtered punctual velocity") + xlab("Time (s)") + ylab("Velocity (m/s)")
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig3}Experimental and simulated flow velocity for the measurement points over time and filtered data using the Kalman Filter with the simulated data set update. Experimental configuration with diameter of 0.04m, and simulated data for the configuration of turbulent flow with 0.04m diameter. ")}
+C3mean <-  model.filteredC3$f + mean(velC)
+A3mean <-  model.filteredA3$f + mean(velA)
+experimentalFilter  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velA[58:177], 
+                                             #model.filteredA3.wmean[59:178], 
+                                             velC[58:177], 
+                                             #model.filteredC3.wmean[59:178],
+                                             C3mean[59:178],
+                                             A3mean[59:178],
+                                             mmA$mitjana[59:178], PTu$velC06[59:178]), 
+                        Data = c(rep("True velocity B", 120), 
+                                 #rep( "Filtered state A MA(2) w intercept", 120),
+                                 rep( "True velocity D",120), 
+                                 #rep( "Filtered State C AR(2) w intercept", 120),
+                                 rep( "FS D AR(2) w/mean", 120),
+                                  rep( "FS B MA(2) w/mean", 120),
+                                 rep("Simulated velocity B", 120), 
+                                 rep("Simulated velocity D", 120)) )
+ggplot(experimentalFilter, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "blue",  "red", "deepskyblue", "coral", "navy", "darkred")) +
+  #scale_linetype_manual(values=c("dotdash", "dashed",  "dotdash","dashed","solid","solid", "solid","solid"))+
+  scale_linetype_manual(values=c( "solid","solid","dotdash","dashed", "dotdash", "dashed"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Observed, simulated and filtered punctual velocity") + 
+  xlab("Time (s)") + ylab("Velocity (m/s)")
+```
+
+```{r include=FALSE}
+
+#### A
+plot(index(velA[60:179]), velA[58:177],  col="navy", type="l", xlab="Time (s)", ylab="Velocity (m/s)", main="KF B turbulent velocity")
+lines(index(velA[60:179]), A3mean[59:178], col="darkturquoise", type="l", lty="dashed")
+legend("topleft", lty=c(1, 2),
+       col=c("navy" , "darkturquoise"),
+       legend=c("true state", "filtered state"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+##error plot 
+#difference between the true and the measured position
+#and the difference between the true position and the filtered position estimate
+
+plot(index(velA[60:179]), (mmA$mitjana[59:178] - 1.056811 + mean(velA) - velA[58:177])^2, col=gray(level=.7), 
+     type="l", xlab="Time (s)", ylab="Velocity error (m/s)", main="Mean squared error")
+lines(index(velA[60:179]), (model.filteredA3$f[59:178] + mean(velA)-velA[58:177])^2, col=gray(level=.2))
+abline(h=0, col="blue", lty=2)
+legend("topright", lty=c(1, 2),
+       col=c(gray(level=.7), col=gray(level=.2), "blue"),
+       legend=c("true state - simulated", "true state - filtered state"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+```
+
+```{r include=FALSE}
+
+#### C
+plot(index(velC[60:179]), velC[58:177],  col="navy", type="l", xlab="Time (s)", ylab="Velocity (m/s)", main="KF D turbulent velocity")
+lines(index(velC[60:179]), C3mean[59:178], col="darkturquoise", type="l", lty="dashed")
+legend("topleft", lty=c(1, 2),
+       col=c("navy" , "darkturquoise"),
+       legend=c("true state", "filtered state"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+##error plot 
+#difference between the true and the measured position
+#and the difference between the true position and the filtered position estimate
+
+plot(index(velC[60:179]), (PTu$velC06[59:178] - 0.8432 + mean(velC) - velC[58:177])^2, col=gray(level=.7), 
+     type="l", xlab="Time (s)", ylab="Velocity error (m/s)", main="Mean squared error")
+lines(index(velC[60:179]), (model.filteredC3$f[59:178] + mean(velC)-velC[58:177])^2, col=gray(level=.2))
+abline(h=0, col="blue", lty=2)
+legend("topright", lty=c(1, 2),
+       col=c(gray(level=.7), col=gray(level=.2), "blue"),
+       legend=c("true state - simulated", "true state - filtered state"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+```
+
+Laminar distribution does not adjust as accurately the experimental observations as the turbulent simulated data. This can indicate that the real system is characterized by high Reynolds numbers, with inertial forces overcoming the viscous forces, due to the lower viscosity of the air at atmospheric conditions.
+
+\section{Ensemble Kalman Filter}
+
+The EnKF takes into consideration the longitudinal velocity profile and the time dependent discrete observations in order to implement a forecast and an update step using the corresponding state vector (simulated state) and the observation state (measured observations). The EnKF uses an ensemble of both states smoothing the distribution and adjusting to the simulated state-space model.
+
+Note that the longitudinal velocity profile is characterized by a decreasing significant step, corresponding to the first nodes situated closer to the flow generator, which is shifted right at the beginning, distorting the velocity distribution. Therefore, the mean data throughout the steadier nodes (longitudinal positions between [50, 140] cm) is considered in order to implement the EnKF.
+
+```{r include=FALSE}
+library(mvtnorm)
+source("http://www.datall-analyse.nl/R/EnKF.R")
+EnKF
+```
+
+\subsection{Laminar Flow}
+
+WN distribution
+
+```{r include=FALSE}
+###
+### WN
+###
+
+laminarV <- LL$vel037[50:139]
+ns <- 120 #number of time itereations
+nc <- 140-50 #number of nodes
+## Specify noises (variances)
+wk <- 5e-5 #process noise
+#vk <- 5e-1 #measurement noise
+vk <- sd(velC)
+##Construct the state transition matrix
+A <- matrix(0, ncol=nc, nrow=nc)
+#Entries of the interior nodes in the transition matrix
+# identity for a white noise
+for(i in 2:(nc-1)) {
+  A[i, i] <- 1
+}
+np <- 2 #number of measurement points
+### Simulated points
+x <- matrix(mean(laminarV), ncol=nc, nrow=ns)
+x[1,] <- laminarV
+set.seed(12)
+for (i in 2:ns) {
+  x[i, ] <-  (A%*%x[i-1, ])+ rnorm(nc, 0, sqrt(wk))}
+x
+dataXT <- as.data.frame(t(x))
+dataXT <- dataXT[2:nc-1,]
+g.dlm <- ggplot(data =dataXT, aes(x= index(dataXT[,1]), y=dataXT[,1] )) + geom_line(color= "navy")+
+  geom_line(aes( y=dataXT[,30]), color = "coral")+
+  geom_line(aes( y=dataXT[,60]), color = "turquoise")+
+  geom_line(aes( y=dataXT[,90]), color = "green")+
+  geom_line(aes( y=dataXT[,120]), color = "pink")+
+  ggtitle("Simulated velocity for different times")+
+  xlab("Node (cm)") + ylab("Velocity (m/s)")
+g.dlm
+
+ex1 <- list(m0=laminarV , #initial state estimates
+            #error covariances of the initial state estimates:
+            C0=diag(rep(0.1, nc)),
+            #measurement noise
+            V=diag(rep(vk, np)),
+            #process noise
+            W=diag(rep(wk, nc)))
+
+#State transition function
+GGfunction <- function (x, k){
+  (A%*%x)}
+#Observation/measurement function
+FFfunction <- function (x, k){
+  # cbind(x[57-50], x[133-50])}
+  cbind(x[7], x[83])}
+
+dataEx2 <- as.data.frame(cbind(velA, velC))
+
+enkf1 <- EnKF(y=dataEx2, mod=ex1, size=10,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+enkf2 <- EnKF(y=dataEx2, mod=ex1, size=25,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+enkf3 <- EnKF(y=dataEx2, mod=ex1, size=50,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+enkf4 <- EnKF(y=dataEx2, mod=ex1, size=100,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+plot(1:nc, laminarV, type="l", col= "black", #col=c(gray(level=.5)),
+     ylim=range(c(enkf1$m[121,], enkf2$m[121,], enkf3$m[121,], enkf4$m[121,])),
+     xlab="Node, i", ylab="Velocity (i)", main="t=2")
+lines(1:nc, enkf1$m[121,], lty=2, col="blue", lwd=1)
+lines(1:nc, enkf2$m[121,], lty=2, col="red", lwd=1)
+lines(1:nc, enkf3$m[121,], lty=2, col="darkgreen", lwd=1)
+lines(1:nc, enkf4$m[121,], lty=2, col="turquoise", lwd=1)
+points(c(57-50, 133-50), dataEx2[120,], col="coral", cex=1, pch = 20)
+legend("bottomleft", lty=c(1, 2, 2, 2),
+       col=c("black", "blue", "red", "darkgreen", "turquoise"),
+       legend=c("true state", "EnKf with 10 members",
+                "EnKf with 25 members", "EnKf with 50 members", "EnKf with 100 members"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+y <- as.data.frame(laminarV)
+
+#Error plot
+par(mfrow=c(1, 1))
+e1 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,]-enkf1$m[i+1,])^2))
+e2 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,]-enkf2$m[i+1,])^2))
+e3 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,]-enkf3$m[i+1,])^2))
+e4 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,]-enkf4$m[i+1,])^2))
+
+rangeError <- range(cbind(e1, e2, e3, e4))
+plot(1:(nrow(y)-10), e1, type="l", lty=1, col="blue", log="y",
+     ylim=rangeError, ylab="Mean Squared Error", xlab="Time index, k")
+lines(1:(nrow(y)-10), e2, lty=1, col="red")
+lines(1:(nrow(y)-10), e3, lty=1, col="darkgreen")
+lines(1:(nrow(y)-10), e4, lty=1, col="turquoise")
+legend("topleft", lty=c(2, 2, 2),
+       col=c("blue", "red", "darkgreen", "turquoise"),
+       legend=c("EnKf with 10 members",
+                "EnKf with 25 members","EnKf with 50 members", "EnKf with 100 members"),
+       bty="n", y.intersp=1.2, cex=.7)
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig9.2}Laminar Flow velocity over longitudinal position adjusting a WN model to the data for different ensemble sizes. Configuration with diameter $0.04m$. ")}
+exp2 <- as.data.frame(cbind(c( 57-51, 133-51), c( velA[120], velC[120])))
+experimentalFilter  <- data.frame(x = index(laminarV), 
+                                  values = c(laminarV, enkf1$m[121,], enkf2$m[121,], 
+                                             enkf3$m[121,], enkf4$m[121,] ), 
+                        Data = c(rep("True State", 90), 
+                                 rep( "EnKf with 10 members", 90),
+                                 rep( "EnKf with 25 members",90), 
+                                 rep( "EnKf with 50 members", 90),
+                                 rep( "EnKf with 100 members", 90) ))
+ggplot(experimentalFilter, aes(x, values, col= Data))+geom_line(size=0.5)+
+  geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_color_manual(values= c( "coral","deepskyblue",  "green", "violet","navy")) +
+  ggtitle("Simulated and filtered velocity") + xlab("x (m)") + ylab("Velocity (m/s)")
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:enkf11}EnKF filtered punctual velocity over time for the configuration of the laminar flow, adjusting an WN model over the simulated data distribution.")}
+#with simulated distribution over longitudinal position adjusting a WN model to the data for different ensemble sizes.
+experimentalFilter  <- data.frame(x = index(velA[61:181]), 
+                                  values = c(velA[59:179], velC[59:179], 
+                                             enkf2$m[62:182,57-50], 
+                                             enkf2$m[62:182,133-50],
+                                             enkf3$m[62:182,57-50],
+                                             enkf3$m[62:182,133-50]
+                                             #enkf2$m[62:182,57-50]+inter, 
+                                             #enkf2$m[62:182,133-50]+inter,
+                                             #enkf3$m[62:182,57-50]+inter,
+                                             #enkf3$m[62:182,133-50]+inter
+                                             ), 
+                        Data = c(rep("True velocity B", 121), 
+                                 rep( "True velocity D", 121),
+                                 rep( "EnKf with 25 members B",121), 
+                                 rep( "EnKf with 25 members D", 121),
+                                 rep( "EnKf with 50 members B", 121),
+                                 rep( "EnKf with 50 members D", 121)))
+ggplot(experimentalFilter, aes(x, values, col= Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c("turquoise", "coral","deepskyblue",  "deeppink","navy", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Experimental and EnKF filtered velocity") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+## així és com millors resultats s'obtenen però no concorden amb els resultats longitudinals
+## En teoria els longitudinals no els mostrem!!!
+```
+
+```{r include=FALSE}
+## comparació A
+CompFilterA  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velA[58:177], model.filteredAL1$f[59:178], 
+                                             PLa$velA037[58:177], 
+                                             enkf3$m[60:179,57-50]
+                                             ), 
+                        Data = c(rep("True velocity A", 120), 
+                                 rep( "Filtered state KF ARIMA(3,0,0)", 120),
+                                 rep("Simulated velocity A", 120), 
+                                 rep("Filtered state EnKF WN", 120)) )
+ggplot(CompFilterA, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "blue","coral", "navy", "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dotdash", "dashed", "solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Observed, simulated and filtered punctual velocity A") + xlab("Time (s)") + ylab("Velocity (m/s)")
+
+
+
+## Error Enkf
+errorA1 <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velA037[59:178]- velA[58:177])^2,
+                                             #(model.filteredAL1$f[59:178]-velA[58:177])^2,
+                                             (enkf2$m[60:179,57-50]- velA[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 #rep( "True state - filtered state KF", 120),
+                                 rep( "True state - filtered state EnKF",120) 
+                                 ))
+
+ggplot(errorA1, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c( "deeppink", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity A") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+## Error entre tots
+errorA <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velA037[59:178]- velA[58:177])^2,
+                                             (model.filteredAL1$f[59:178]-velA[58:177])^2,
+                                             (enkf3$m[60:179,57-50]- velA[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 rep( "True state - filtered state KF", 120),
+                                 rep( "True state - filtered state EnKF",120) 
+                                 ))
+
+ggplot(errorA, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c( "deeppink","turquoise", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash", "dashed", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity A") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+mean(( model.filteredAL$f[59:178]-velA[58:177])^2) # 0.0006765584
+mean(( model.filteredAL1$f[59:178]-velA[58:177])^2) # 0.0006768531
+mean((PLa$velA037[59:178]- velA[58:177])^2) ## 0.0001393601
+
+enkfWN <- enkf2
+
+```
+
+```{r include=FALSE}
+## comparació C
+CompFilterC  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velC[58:177], model.filteredCL1$f[59:178], 
+                                             PLa$velC037[58:177], 
+                                             enkfWN$m[60:179,133-50]
+                                             ), 
+                        Data = c(rep("True velocity", 120), 
+                                 rep( "Filtered state KF ARIMA(3,0,1)", 120),
+                                 rep("Simulated velocity", 120), 
+                                 rep("Filtered state EnKF AR(2)", 120)) )
+ggplot(CompFilterC, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "blue","coral", "navy", "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dotdash", "dashed", "solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Observed, simulated and filtered punctual velocity A") + xlab("Time (s)") + ylab("Velocity (m/s)")
+
+
+
+## Error Enkf
+errorC1 <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velC037[59:178]- velC[58:177])^2,
+                                             #(model.filteredAL1$f[59:178]-velA[58:177])^2,
+                                             (enkfWN$m[60:179,133-50]- velC[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 #rep( "True state - filtered state KF", 120),
+                                 rep( "True state - filtered state EnKF",120) 
+                                 ))
+
+ggplot(errorC1, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c( "deeppink", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity C") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+## Error entre tots
+errorC <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velC037[59:178]- velC[58:177])^2,
+                                             (model.filteredCL1$f[59:178]-velC[58:177])^2,
+                                             (enkfWN$m[60:179,133-50]- velC[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 rep( "True state - filtered state KF", 120),
+                                 rep( "True state - filtered state EnKF",120) 
+                                 ))
+
+ggplot(errorC, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c( "deeppink","turquoise", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash", "dashed", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity C") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+mean(( model.filteredCL$f[59:178]-velC[58:177])^2) # 0.0006765584
+mean(( model.filteredCL1$f[59:178]-velC[58:177])^2) # 0.0006768531
+mean((PLa$velC037[59:178]- velC[58:177])^2) ## 0.0001393601
+```
+
+AR(2) distribution
+
+```{r include=FALSE}
+laminarV <- LL$vel037[50:139]
+auto.arima(laminarV) ## ARIMA(0,0,2) with non-zero mean 
+##log likelihood=381.63
+mod1 <- arima(laminarV, order=c(2,0,0), include.mean = TRUE )
+mod1
+##log likelihood = 381.34 AR(2)
+##log likelihood = 379.65 ARMA(1,1)
+
+ns <- 120 #number of time itereations
+nc <- 140-50 #number of nodes
+## Specify noises (variances)
+wk <- 5e-5 #process noise
+#vk <- 5e-1 #measurement noise
+vk <- sd(velC)
+
+
+## EnKF AR(2)
+m1.enkf <- dlmModARMA( ar= c(0.8764,-0.3112))
+m1.enkf
+inter <- 1.0422
+
+p1 <- 0.8764
+p2 <- -0.3112
+
+## AR(2) w intercept
+even_rows <- seq_len(nc)%%2
+B=matrix(0, ncol=nc, nrow=nc)
+B[even_rows==0,even_rows==0] <- p1
+A <- diag(B[2,])
+for(i in 1:(nc-1)) {
+  if(A[i,i] == 0){
+    A[i, i+1] <- 1
+  }
+  else if(A[i,i] == p1){
+    A[i, i-1] <- p2
+  }
+}
+
+x <- matrix(inter, ncol=nc, nrow=ns)
+x[1,] <- laminarV
+set.seed(12)
+for (i in 3:ns) {
+  x[i, ] <-  (A%*%x[i-1, ])+ rnorm(nc, 0, sqrt(wk))}
+x
+
+dataXT <- as.data.frame(t(x))
+dataXT <- dataXT[2:nc-1,]
+
+dataXT2 <- dataXT[2:(nc-5),]
+
+g.dlm <- ggplot(data =dataXT2, aes(x= index(dataXT2[,1]), y=dataXT2[,1] )) + geom_line(color= "navy")+
+  geom_line(aes( y=dataXT2[,30]+inter), color = "coral")+
+  geom_line(aes( y=dataXT2[,60]+inter), color = "turquoise")+
+  geom_line(aes( y=dataXT2[,90]+inter), color = "green")+
+  geom_line(aes( y=dataXT2[,120]+inter), color = "pink")+
+  ggtitle("Simulated velocity for different times")+
+  xlab("Node (cm)") + ylab("Velocity (m/s)")
+g.dlm
+
+np <- 2
+ex1 <- list(m0=laminarV , #initial state estimates
+            #error covariances of the initial state estimates:
+            C0=diag(rep(0.1, nc)),
+            #measurement noise
+            V=diag(rep(vk, np)),
+            #process noise
+            W=diag(rep(wk, nc)))
+
+#State transition function
+GGfunction <- function (x, k){
+#  0.9834*vk+(A%*%x)}
+#0.9834*x+(A%*%x)}
+(A%*% x)}
+#Observation/measurement function
+FFfunction <- function (x, k){
+  cbind(x[7], x[83])}
+
+dataEx2 <- as.data.frame(cbind(velA, velC))
+
+enkf1 <- EnKF(y=dataEx2, mod=ex1, size=10,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+enkf2 <- EnKF(y=dataEx2, mod=ex1, size=25,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+enkf3 <- EnKF(y=dataEx2, mod=ex1, size=50,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+enkf4 <- EnKF(y=dataEx2, mod=ex1, size=100,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+plot(1:nc, laminarV, type="l", col= "black", #col=c(gray(level=.5)),
+     ylim=range(c(enkf1$m[121,], enkf2$m[121,], enkf3$m[121,], enkf4$m[121,])),
+     xlab="Node, i", ylab="Velocity (i)", main="t=2")
+lines(1:nc, enkf1$m[121,], lty=2, col="blue", lwd=1)
+lines(1:nc, enkf2$m[121,], lty=2, col="red", lwd=1)
+lines(1:nc, enkf3$m[121,], lty=2, col="darkgreen", lwd=1)
+lines(1:nc, enkf4$m[121,], lty=2, col="turquoise", lwd=1)
+points(c(57-50, 133-50), dataEx2[120,], col="coral", cex=1, pch = 20)
+legend("bottomleft", lty=c(1, 2, 2, 2),
+       col=c("black", "blue", "red", "darkgreen", "turquoise"),
+       legend=c("true state", "EnKf with 10 members",
+                "EnKf with 25 members", "EnKf with 50 members", "EnKf with 100 members"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+#y <- as.data.frame(Laminar$vel035[50:139])
+y <- as.data.frame(laminarV)
+
+#Error plot respecte de les simulades
+par(mfrow=c(1, 1))
+e1 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,]-enkf1$m[i+1,]+inter)^2))
+e2 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,]-enkf2$m[i+1,]+inter)^2))
+e3 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,]-enkf3$m[i+1,]+inter)^2))
+e4 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,]-enkf4$m[i+1,]+inter)^2))
+
+rangeError <- range(cbind(e1, e2, e3, e4))
+plot(1:(nrow(y)-10), e1, type="l", lty=1, col="blue", log="y",
+     ylim=rangeError, ylab="Mean Squared Error", xlab="Time index, k")
+lines(1:(nrow(y)-10), e2, lty=1, col="red")
+lines(1:(nrow(y)-10), e3, lty=1, col="darkgreen")
+lines(1:(nrow(y)-10), e4, lty=1, col="turquoise")
+legend("topleft", lty=c(2, 2, 2),
+       col=c("blue", "red", "darkgreen", "turquoise"),
+       legend=c("EnKf with 10 members",
+                "EnKf with 20 members","EnKf with 25 members", "EnKf with 100 members"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+## Error plot respecte de les experimentals! 
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:enkfL1}Laminar Flow velocity over longitudinal position adjusting an AR(2) with non zero mean model to the data for different ensemble sizes. ")}
+exp2 <- as.data.frame(cbind(c( 57-51, 133-51), c( velA[120], velC[120])))
+experimentalFilter  <- data.frame(x = index(laminarV[1:(nc-2)]), 
+                                  values = c(laminarV[1:(nc-2)], 
+                                             enkf1$m[121,1:(nc-2)]+inter,
+                                             enkf2$m[121,1:(nc-2)]+inter, 
+                                             enkf3$m[121,1:(nc-2)]+inter, 
+                                             enkf4$m[121,1:(nc-2)]+inter
+                                             #enkf1$m[121,1:(nc-2)]+inter,
+                                             #enkf2$m[121,1:(nc-2)]+inter, 
+                                             #enkf3$m[121,1:(nc-2)]+inter, 
+                                             #enkf4$m[121,1:(nc-2)]+inter
+                                             ), 
+                        Data = c(rep("True State", 88), 
+                                 rep( "EnKf with 10 members", 88),
+                                 rep( "EnKf with 25 members", 88), 
+                                 rep( "EnKf with 50 members", 88),
+                                 rep( "EnKf with 100 members", 88) ))
+ggplot(experimentalFilter, aes(x, values, col= Data))+geom_line(size=0.5)+
+  geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c( "coral","deepskyblue",  "green", "violet","navy")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Simulated and filtered velocity") + xlab("x (m)") + ylab("Velocity (m/s)")
+
+enkfAR2 <- enkf2
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:enkf2}EnKF filtered punctual velocity over time for the configuration of the laminar flow, adjusting an AR(2) model over the simulated data distribution. Configuration with diameter 0.035m.")}
+#with simulated distribution over longitudinal position adjusting a WN model to the data for different ensemble sizes.
+experimentalFilter  <- data.frame(x = index(velA[61:181]), 
+                                  values = c(velA[59:179], velC[59:179], 
+                                             enkf2$m[62:182,57-50]+mean(velA[61:181]), 
+                                             enkf2$m[62:182,133-50]+mean(velC[61:181]),
+                                             enkf3$m[62:182,57-50]+mean(velA[61:181]),
+                                             enkf3$m[62:182,133-50]+mean(velC[61:181])
+                                             #enkf2$m[62:182,57-50]+inter, 
+                                             #enkf2$m[62:182,133-50]+inter,
+                                             #enkf3$m[62:182,57-50]+inter,
+                                             #enkf3$m[62:182,133-50]+inter
+                                             ), 
+                        Data = c(rep("True velocity B", 121), 
+                                 rep( "True velocity D", 121),
+                                 rep( "EnKf with 25 members B",121), 
+                                 rep( "EnKf with 25 members D", 121),
+                                 rep( "EnKf with 50 members B", 121),
+                                 rep( "EnKf with 50 members D", 121)))
+ggplot(experimentalFilter, aes(x, values, col= Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c("turquoise", "coral","deepskyblue",  "deeppink","navy", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Experimental and EnKF filtered velocity") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+## així és com millors resultats s'obtenen però no concorden amb els resultats longitudinals
+## En teoria els longitudinals no els mostrem!!!
+```
+
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:enkf2}EnKF filtered punctual velocity over time for the configuration of the laminar flow, adjusting different models over the simulated data distribution. Configuration with diameter 0.035m.")}
+#with simulated distribution over longitudinal position adjusting a WN model to the data for different ensemble sizes.
+experimentalFilter  <- data.frame(x = index(velA[61:181]), 
+                                  values = c(velA[59:179], velC[59:179], 
+                                             enkf2$m[62:182,57-50]+mean(velA[61:181]), 
+                                             enkf2$m[62:182,133-50]+mean(velC[61:181]),
+                                             enkfWN$m[62:182,57-50],
+                                             enkfWN$m[62:182,133-50]
+                                             #enkf3$m[62:182,57-50]+mean(velA[61:181]),
+                                             #enkf3$m[62:182,133-50]+mean(velC[61:181])
+                                             #enkf2$m[62:182,57-50]+inter, 
+                                             #enkf2$m[62:182,133-50]+inter,
+                                             #enkf3$m[62:182,57-50]+inter,
+                                             #enkf3$m[62:182,133-50]+inter
+                                             ), 
+                        Data = c(rep("True velocity B", 121), 
+                                 rep( "True velocity D", 121),
+                                 rep( "EnKf B AR(2)",121), 
+                                 rep( "EnKf D AR(2)", 121),
+                                 rep( "EnKf B WN", 121),
+                                 rep( "EnKf D WN", 121)))
+ggplot(experimentalFilter, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c("turquoise", "blue", "coral",  "red", "navy", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("solid", "solid", "solid", "solid", "dotdash", "dashed"))+
+  #ggtitle("Experimental and EnKF filtered velocity") + 
+  xlab("t (s)") + ylab("Velocity (m/s)")
+
+## així és com millors resultats s'obtenen però no concorden amb els resultats longitudinals
+## En teoria els longitudinals no els mostrem!!!
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:enkf2}EnKF filtered punctual velocity over time for the configuration of the laminar flow, adjusting an AR(2) model over the simulated data distribution. Configuration with diameter 0.035m.")}
+#with simulated distribution over longitudinal position adjusting a WN model to the data for different ensemble sizes.
+experimentalFilter  <- data.frame(x = index(velA[61:181]), 
+                                  values = c(velA[61:181], velC[61:181], 
+                                             #enkf2$m[62:182,57-50]+mean(velA[61:181]), 
+                                             #enkf2$m[62:182,133-50]+mean(velC[61:181]),
+                                             #enkf3$m[62:182,57-50]+mean(velA[61:181]),
+                                             #enkf3$m[62:182,133-50]+mean(velC[61:181])
+                                             enkf2$m[62:182,57-50]+inter, 
+                                             enkf2$m[62:182,133-50]+inter,
+                                             enkf3$m[62:182,57-50]+inter,
+                                             enkf3$m[62:182,133-50]+inter
+                                             ), 
+                        Data = c(rep("True velocity B", 121), 
+                                 rep( "True velocity D", 121),
+                                 rep( "EnKf with 20 members B",121), 
+                                 rep( "EnKf with 20 members D", 121),
+                                 rep( "EnKf with 25 members B", 121),
+                                 rep( "EnKf with 25 members D", 121)))
+ggplot(experimentalFilter, aes(x, values, col= Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c("turquoise", "coral","deepskyblue",  "deeppink","navy", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Experimental and EnKF filtered velocity") + xlab("t (s)") + ylab("Velocity (m/s)")
+```
+
+```{r include=FALSE}
+## comparació A
+CompFilterA  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velA[58:177], model.filteredAL1$f[59:178], 
+                                             PLa$velA037[58:177], 
+                                             enkf2$m[60:179,57-50]+mean(velA[61:180]),
+                                             enkfWN$m[60:179,57-50]
+                                             ), 
+                        Data = c(rep("True velocity A", 120), 
+                                 rep( "Filtered state KF ARIMA(3,0,0)", 120),
+                                 rep("Simulated velocity A", 120), 
+                                 rep("Filtered state EnKF AR(2)", 120),
+                                 rep("Filtered state EnKF WN", 120)
+                                 ) )
+ggplot(CompFilterA, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "blue", "navy", "coral", "violet",  "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dotdash","dotdash", "dashed", "solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Observed, simulated and filtered punctual velocity A") + xlab("Time (s)") + ylab("Velocity (m/s)")
+
+
+
+## Error Enkf
+errorA1 <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velA037[59:178]- velA[58:177])^2,
+                                             #(model.filteredAL1$f[59:178]-velA[58:177])^2,
+                                             (enkf2$m[60:179,57-50]+mean(velA[61:180])- velA[58:177])^2,
+                                             (enkfWN$m[60:179,57-50]- velA[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 rep( "True state - filtered state EnKF AR(2)", 120),
+                                 rep( "True state - filtered state EnKF WN",120) 
+                                 ))
+
+ggplot(errorA1, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c( "deeppink", "coral", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash", "dotdash", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity A") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+## Error entre tots
+errorA <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velA037[59:178]- velA[58:177])^2,
+                                             (model.filteredAL1$f[59:178]-velA[58:177])^2,
+                                             (enkf2$m[60:179,57-50]+mean(velA[61:180])- velA[58:177])^2, 
+                                             (enkfWN$m[60:179,57-50]- velA[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 rep( "True state - filtered state KF", 120),
+                                 rep( "True state - filtered state EnKF AR(2)",120) , 
+                                 rep( "True state - filtered state EnKF WN",120) 
+                                 ))
+
+ggplot(errorA, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c("blue", "deeppink", "violet", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash","dotdash", "dashed", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity A") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+mean(( model.filteredAL$f[59:178]-velA[58:177])^2) # 0.0006765584
+mean(( model.filteredAL1$f[59:178]-velA[58:177])^2) # 0.0006768531
+mean((PLa$velA037[59:178]- velA[58:177])^2) ## 0.0001393601
+
+
+```
+
+```{r include=FALSE}
+## comparació C
+CompFilterC  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velC[58:177], model.filteredCL1$f[59:178], 
+                                             PLa$velC037[58:177], 
+                                             enkf2$m[60:179,133-50]+mean(velC[61:180]),
+                                             enkfWN$m[60:179,133-50]
+                                             ), 
+                        Data = c(rep("True velocity", 120), 
+                                 rep( "Filtered state KF ARIMA(3,0,1)", 120),
+                                 rep("Simulated velocity", 120), 
+                                 rep("Filtered state EnKF AR(2)", 120),
+                                 rep("Filtered state EnKF WN", 120)
+                                 ) )
+ggplot(CompFilterC, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "blue", "navy", "coral", "violet",  "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dotdash","dotdash", "dashed", "solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Observed, simulated and filtered punctual velocity A") + xlab("Time (s)") + ylab("Velocity (m/s)")
+
+
+
+## Error Enkf
+errorC1 <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velC037[59:178]- velC[58:177])^2,
+                                             #(model.filteredAL1$f[59:178]-velA[58:177])^2,
+                                             (enkf2$m[60:179,133-50]+mean(velC[61:180])- velC[58:177])^2,
+                                             (enkfWN$m[60:179,133-50]- velC[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 rep( "True state - filtered state EnKF AR(2)", 120),
+                                 rep( "True state - filtered state EnKF WN",120) 
+                                 ))
+
+ggplot(errorC1, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c( "deeppink", "coral", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash", "dotdash", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity A") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+## Error entre tots
+errorC <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velC037[59:178]- velC[58:177])^2,
+                                             (model.filteredCL1$f[59:178]-velC[58:177])^2,
+                                             (enkf2$m[60:179,133-50]+mean(velC[61:180])- velC[58:177])^2,
+                                             (enkfWN$m[60:179,133-50]- velC[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 rep( "True state - filtered state KF", 120),
+                                 rep( "True state - filtered state EnKF AR(2)", 120),
+                                 rep( "True state - filtered state EnKF WN",120) 
+                                 ))
+
+ggplot(errorC, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c("blue", "deeppink", "violet", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash","dotdash", "dashed", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity A") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+
+mean(( model.filteredCL$f[59:178]-velC[58:177])^2) # 0.0006765584
+mean(( model.filteredCL1$f[59:178]-velC[58:177])^2) # 0.0006768531
+mean((PLa$velC037[59:178]- velC[58:177])^2) ## 0.0001393601
+```
+
+\section{Turbulent flow}
+
+```{r include=FALSE}
+###
+### WN
+###
+
+turb <- mm$mitjana045[50:139]
+
+
+ns <- 120 #number of time itereations
+nc <- 140-50 #number of nodes
+## Specify noises (variances)
+wk <- 5e-5 #process noise
+#vk <- 5e-1 #measurement noise
+vk <- sd(velC)
+##Construct the state transition matrix
+A <- matrix(0, ncol=nc, nrow=nc)
+#Entries of the interior nodes in the transition matrix
+# identity for a white noise
+for(i in 2:(nc-1)) {
+  A[i, i] <- 1
+}
+np <- 2 #number of measurement points
+### Simulated points
+x <- matrix(mean(turb), ncol=nc, nrow=ns)
+x[1,] <- turb
+set.seed(12)
+for (i in 2:ns) {
+  x[i, ] <-  (A%*%x[i-1, ])+ rnorm(nc, 0, sqrt(wk))}
+x
+dataXT <- as.data.frame(t(x))
+dataXT <- dataXT[2:nc-1,]
+g.dlm <- ggplot(data =dataXT, aes(x= index(dataXT[,1]), y=dataXT[,1] )) + geom_line(color= "navy")+
+  geom_line(aes( y=dataXT[,30]), color = "coral")+
+  geom_line(aes( y=dataXT[,60]), color = "turquoise")+
+  geom_line(aes( y=dataXT[,90]), color = "green")+
+  geom_line(aes( y=dataXT[,120]), color = "pink")+
+  ggtitle("Simulated velocity for different times")+
+  xlab("Node (cm)") + ylab("Velocity (m/s)")
+g.dlm
+
+ex1 <- list(m0=turb , #initial state estimates
+            #error covariances of the initial state estimates:
+            C0=diag(rep(0.1, nc)),
+            #measurement noise
+            V=diag(rep(vk, np)),
+            #process noise
+            W=diag(rep(wk, nc)))
+
+#State transition function
+GGfunction <- function (x, k){
+  (A%*%x)}
+#Observation/measurement function
+FFfunction <- function (x, k){
+  # cbind(x[57-50], x[133-50])}
+  cbind(x[7], x[83])}
+
+dataEx2 <- as.data.frame(cbind(velA, velC))
+
+enkf1 <- EnKF(y=dataEx2, mod=ex1, size=10,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+enkf2 <- EnKF(y=dataEx2, mod=ex1, size=25,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+enkf3 <- EnKF(y=dataEx2, mod=ex1, size=50,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+enkf4 <- EnKF(y=dataEx2, mod=ex1, size=100,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+plot(1:nc, turb, type="l", col= "black", #col=c(gray(level=.5)),
+     ylim=range(c(enkf1$m[121,], enkf2$m[121,], enkf3$m[121,], enkf4$m[121,])),
+     xlab="Node, i", ylab="Velocity (i)", main="t=2")
+lines(1:nc, enkf1$m[121,], lty=2, col="blue", lwd=1)
+lines(1:nc, enkf2$m[121,], lty=2, col="red", lwd=1)
+lines(1:nc, enkf3$m[121,], lty=2, col="darkgreen", lwd=1)
+lines(1:nc, enkf4$m[121,], lty=2, col="turquoise", lwd=1)
+points(c(57-50, 133-50), dataEx2[120,], col="coral", cex=1, pch = 20)
+legend("bottomleft", lty=c(1, 2, 2, 2),
+       col=c("black", "blue", "red", "darkgreen", "turquoise"),
+       legend=c("true state", "EnKf with 10 members",
+                "EnKf with 25 members", "EnKf with 50 members", "EnKf with 100 members"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+y <- as.data.frame(turb)
+
+#Error plot
+par(mfrow=c(1, 1))
+e1 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,]-enkf1$m[i+1,])^2))
+e2 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,]-enkf2$m[i+1,])^2))
+e3 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,]-enkf3$m[i+1,])^2))
+e4 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,]-enkf4$m[i+1,])^2))
+
+rangeError <- range(cbind(e1, e2, e3, e4))
+plot(1:(nrow(y)-10), e1, type="l", lty=1, col="blue", log="y",
+     ylim=rangeError, ylab="Mean Squared Error", xlab="Time index, k")
+lines(1:(nrow(y)-10), e2, lty=1, col="red")
+lines(1:(nrow(y)-10), e3, lty=1, col="darkgreen")
+lines(1:(nrow(y)-10), e4, lty=1, col="turquoise")
+legend("topleft", lty=c(2, 2, 2),
+       col=c("blue", "red", "darkgreen", "turquoise"),
+       legend=c("EnKf with 10 members",
+                "EnKf with 25 members","EnKf with 50 members", "EnKf with 100 members"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+enkfTWN <- enkf3
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig9.2}Turbulent Flow velocity over longitudinal position adjusting a WN model to the data for different ensemble sizes. Configuration with diameter $0.04m$. ")}
+experimentalFilter  <- data.frame(x = index(turb), 
+                                  values = c(turb, enkf1$m[121,], enkf2$m[121,], 
+                                             enkf3$m[121,], enkf4$m[121,] ), 
+                        Data = c(rep("True State", 90), 
+                                 rep( "EnKf with 10 members", 90),
+                                 rep( "EnKf with 25 members",90), 
+                                 rep( "EnKf with 50 members", 90),
+                                 rep( "EnKf with 100 members", 90) ))
+ggplot(experimentalFilter, aes(x, values, col= Data))+geom_line(size=0.5)+
+  geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_color_manual(values= c( "coral","deepskyblue",  "green", "violet","navy")) +
+  ggtitle("Simulated and filtered velocity") + xlab("x (m)") + ylab("Velocity (m/s)")
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:enkfT1}EnKF filtered punctual velocity over time for the configuration of the turbulent flow, adjusting an WN model over the simulated data distribution. Configuration with diameter 0.04m.")}
+#with simulated distribution over longitudinal position adjusting a WN model to the data for different ensemble sizes.
+experimentalFilter  <- data.frame(x = index(velA[61:181]), 
+                                  values = c(velA[59:179], velC[59:179], 
+                                             enkf2$m[62:182,57-50], 
+                                             enkf2$m[62:182,133-50],
+                                             enkf3$m[62:182,57-50],
+                                             enkf3$m[62:182,133-50]
+                                             #enkf2$m[62:182,57-50]+inter, 
+                                             #enkf2$m[62:182,133-50]+inter,
+                                             #enkf3$m[62:182,57-50]+inter,
+                                             #enkf3$m[62:182,133-50]+inter
+                                             ), 
+                        Data = c(rep("True velocity B", 121), 
+                                 rep( "True velocity D", 121),
+                                 rep( "EnKf with 25 members B",121), 
+                                 rep( "EnKf with 25 members D", 121),
+                                 rep( "EnKf with 50 members B", 121),
+                                 rep( "EnKf with 50 members D", 121)))
+ggplot(experimentalFilter, aes(x, values, col= Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c("turquoise", "coral","deepskyblue",  "deeppink","navy", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Experimental and EnKF filtered velocity") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+## així és com millors resultats s'obtenen però no concorden amb els resultats longitudinals
+## En teoria els longitudinals no els mostrem!!!
+```
+
+```{r include=FALSE}
+## comparació A tots
+CompFilterA  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velA[58:177], model.filteredAL1$f[59:178], 
+                                             A3mean[59:178],
+                                             PLa$velA037[58:177], 
+                                             PTu$velA06[58:177],
+                                             enkfTWN$m[60:179,57-50],
+                                             enkfWN$m[60:179,57-50],
+                                             enkfAR2$m[60:179,57-50]+mean(velA[61:180])
+                                             ), 
+                        Data = c(rep("True velocity A", 120), 
+                                 rep( "Filtered state KF laminar AR(3) with mean", 120),
+                                 rep( "Filtered state KF turbulent AR(2) with mean", 120),
+                                 rep("Simulated velocity laminar", 120), 
+                                 rep("Simulated velocity turbulent", 120), 
+                                 rep("Filtered state EnKF turbulent WN", 120),
+                                 rep("Filtered state EnKF laminar WN", 120),
+                                 rep("Filtered state EnKF laminar AR(2) with mean", 120)
+                                 ) )
+ggplot(CompFilterA, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "blue", "navy", "turquoise", "coral", "red", "violet", "green", "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dotdash","dotdash", "dotdash", "dotdash", "dashed", "dashed", "solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Observed, simulated and filtered punctual velocity A") + xlab("Time (s)") + ylab("Velocity (m/s)")
+
+
+## comparació A tots
+CompFilterA  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velA[58:177], 
+                                             #model.filteredAL1$f[59:178], 
+                                             A3mean[59:178],
+                                             #PLa$velA037[58:177], 
+                                             #PTu$velA06[58:177],
+                                             enkfTWN$m[60:179,57-50],
+                                             enkfWN$m[60:179,57-50],
+                                             enkfAR2$m[60:179,57-50]+mean(velA[61:180])
+                                             ), 
+                        Data = c(rep("True velocity A", 120), 
+                                 #rep( "Filtered state KF laminar AR(3) with mean", 120),
+                                 rep( "Filtered state KF turbulent AR(2) with mean", 120),
+                                 #rep("Simulated velocity laminar", 120), 
+                                 #rep("Simulated velocity turbulent", 120), 
+                                 rep("Filtered state EnKF WN", 120),
+                                 rep("Filtered state EnKF laminar WN", 120),
+                                 rep("Filtered state EnKF laminar AR(2) with mean", 120)
+                                 ) )
+ggplot(CompFilterA, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "blue", "navy", "coral", "red",  "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dotdash", "dotdash","dotdash", "solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Observed, simulated and filtered punctual velocity A") + xlab("Time (s)") + ylab("Velocity (m/s)")
+
+### Els wn del turbulent i del laminar són iguals (estem aplicant un wn igualment, no cal possar-lo dos cops
+### als 2 mins ja no fa tanta diferència la condició inicial. Ens quedem amb el WN laminar per fer l'última)
+
+## La resta de diferències seran equivalents a les del wn anterior
+
+## Error Enkf
+errorA1 <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velA037[59:178]- velA[58:177])^2,
+                                             #(model.filteredAL1$f[59:178]-velA[58:177])^2,
+                                             (enkf2$m[60:179,57-50]+mean(velA[61:180])- velA[58:177])^2,
+                                             (enkfWN$m[60:179,57-50]- velA[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 rep( "True state - filtered state EnKF AR(2)", 120),
+                                 rep( "True state - filtered state EnKF WN",120) 
+                                 ))
+
+ggplot(errorA1, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c( "deeppink", "coral", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash", "dotdash", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity A") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+## Error entre tots
+errorA <- data.frame(x = index(velA[61:180]), 
+                                  values = c(#(PLa$velA037[59:178]- velA[58:177])^2,
+                                    (mm$mitjana045[59:178]- velA[58:177])^2,
+                                             (A3mean[59:178]-velA[58:177])^2,
+                                             (enkfAR2$m[60:179,57-50]+mean(velA[61:180])- velA[58:177])^2, 
+                                             (enkfTWN$m[60:179,57-50] - velA[58:177] )^2,
+                                             (enkfWN$m[60:179,57-50]- velA[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 rep( "True state - filtered state KF", 120),
+                                 rep( "True state - filtered state EnKF AR(2)",120) , 
+                                 rep( "True state - filtered state EnKF Laminar WN",120),
+                                 rep( "True state - filtered state EnKF Turbulent WN",120) 
+                                 ))
+
+ggplot(errorA, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c("blue", "deeppink", "violet", "coral", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash","dotdash", "dashed","dashed", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity A") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+mean(( model.filteredAL$f[59:178]-velA[58:177])^2) # 0.0006765584
+mean(( model.filteredAL1$f[59:178]-velA[58:177])^2) # 0.0006768531
+mean((PLa$velA037[59:178]- velA[58:177])^2) ## 0.0001393601
+
+
+```
+
+```{r include=FALSE}
+## comparació C
+CompFilterC  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velC[58:177], model.filteredCL1$f[59:178], 
+                                             PLa$velC037[58:177], 
+                                             enkf2$m[60:179,133-50]+mean(velC[61:180]),
+                                             enkfWN$m[60:179,133-50]
+                                             ), 
+                        Data = c(rep("True velocity", 120), 
+                                 rep( "Filtered state KF ARIMA(3,0,1)", 120),
+                                 rep("Simulated velocity", 120), 
+                                 rep("Filtered state EnKF AR(2)", 120),
+                                 rep("Filtered state EnKF WN", 120)
+                                 ) )
+ggplot(CompFilterC, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "blue", "navy", "coral", "violet",  "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dotdash","dotdash", "dashed", "solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Observed, simulated and filtered punctual velocity A") + xlab("Time (s)") + ylab("Velocity (m/s)")
+
+
+
+## Error Enkf
+errorC1 <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velC037[59:178]- velC[58:177])^2,
+                                             #(model.filteredAL1$f[59:178]-velA[58:177])^2,
+                                             (enkf2$m[60:179,133-50]+mean(velC[61:180])- velC[58:177])^2,
+                                             (enkfWN$m[60:179,133-50]- velC[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 rep( "True state - filtered state EnKF AR(2)", 120),
+                                 rep( "True state - filtered state EnKF WN",120) 
+                                 ))
+
+ggplot(errorC1, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c( "deeppink", "coral", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash", "dotdash", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity A") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+## Error entre tots
+errorC <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velC037[59:178]- velC[58:177])^2,
+                                             (model.filteredCL1$f[59:178]-velC[58:177])^2,
+                                             (enkf2$m[60:179,133-50]+mean(velC[61:180])- velC[58:177])^2,
+                                             (enkfWN$m[60:179,133-50]- velC[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 rep( "True state - filtered state KF", 120),
+                                 rep( "True state - filtered state EnKF AR(2)", 120),
+                                 rep( "True state - filtered state EnKF WN",120) 
+                                 ))
+
+ggplot(errorC, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c("blue", "deeppink", "violet", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash","dotdash", "dashed", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity A") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+
+mean(( model.filteredCL$f[59:178]-velC[58:177])^2) # 0.0006765584
+mean(( model.filteredCL1$f[59:178]-velC[58:177])^2) # 0.0006768531
+mean((PLa$velC037[59:178]- velC[58:177])^2) ## 0.0001393601
+```
+
+```{r include=FALSE}
+
+
+#turb <- LD$vel04[50:139]
+turb <- mm$mitjana045[50:139]
+auto.arima(turb) ## ARIMA(5,2,0) really ARIMA(2,2,0) 
+##log likelihood=652.06
+mod1 <- arima(turb, order=c(2,1,0), include.mean = TRUE )
+mod1
+## log likelihood = 621.2 ARIMA(2,1,0)
+##log likelihood = 627.44 ARima(2,2,0)
+##log likelihood = 624.29 arima(3,1,0)
+##log likelihood = 636.1 ARiMA(3,2,0)
+##log likelihood = 648.34 ARIMA(4,2,0)
+
+mod1 <- arima(turb, order=c(2,2,1), include.mean = TRUE )
+mod1
+## log likelihood = 646.78 arima(2,2,1)
+
+mod1 <- arima(turb, order=c(6,0,0), include.mean = TRUE )
+mod1
+## log likelihood = 652.36 arima(5,0,0) with non zero mean
+## 662.94 ar(6) 
+
+## hauré de fer el arim(4,2,0)
+
+
+## arima(2,1,0) primer sense intercept
+
+ns <- 120 #number of time itereations
+nc <- 140-50 #number of nodes
+## Specify noises (variances)
+wk <- 5e-5 #process noise
+#vk <- 5e-1 #measurement noise
+vk <- sd(velC)
+
+
+## EnKF AR(2)
+m1.enkf <- dlmModARMA( ar= c(0.8764,-0.3112))
+m1.enkf
+inter <- 1.0422
+
+p1 <- 0.4341
+p2 <- 0.5654
+
+## AR(2) w intercept
+even_rows <- seq_len(nc)%%2
+B=matrix(0, ncol=nc, nrow=nc)
+B[even_rows==0,even_rows==0] <- p1
+A <- diag(B[2,])
+for(i in 1:(nc-1)) {
+  if(A[i,i] == 0){
+    A[i, i+1] <- 1
+  }
+  else if(A[i,i] == p1){
+    A[i, i-1] <- p2
+  }
+}
+
+x <- matrix(mean(turb), ncol=nc, nrow=ns)
+x[1,] <- turb
+set.seed(12)
+for (i in 3:ns) {
+  x[i, ] <-  (A%*%x[i-1, ])+ rnorm(nc, 0, sqrt(wk))}
+x
+
+dataXT <- as.data.frame(t(x))
+dataXT <- dataXT[2:nc-1,]
+
+dataXT2 <- dataXT[2:(nc-5),]
+
+g.dlm <- ggplot(data =dataXT2, aes(x= index(dataXT2[,1]), y=dataXT2[,1] )) + geom_line(color= "navy")+
+  geom_line(aes( y=dataXT2[,30]), color = "coral")+
+  geom_line(aes( y=dataXT2[,60]), color = "turquoise")+
+  geom_line(aes( y=dataXT2[,90]), color = "green")+
+  geom_line(aes( y=dataXT2[,120]), color = "pink")+
+  ggtitle("Simulated velocity for different times")+
+  xlab("Node (cm)") + ylab("Velocity (m/s)")
+g.dlm
+
+## bastant potato
+
+np <- 2
+ex1 <- list(m0=turb , #initial state estimates
+            #error covariances of the initial state estimates:
+            C0=diag(rep(0.1, nc)),
+            #measurement noise
+            V=diag(rep(vk, np)),
+            #process noise
+            W=diag(rep(wk, nc)))
+
+#State transition function
+GGfunction <- function (x, k){
+#  0.9834*vk+(A%*%x)}
+#0.9834*x+(A%*%x)}
+(A%*% x)}
+#Observation/measurement function
+FFfunction <- function (x, k){
+  cbind(x[7], x[83])}
+
+dataEx2 <- as.data.frame(cbind(velA, velC))
+
+enkf1 <- EnKF(y=dataEx2, mod=ex1, size=10,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+enkf2 <- EnKF(y=dataEx2, mod=ex1, size=25,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+enkf3 <- EnKF(y=dataEx2, mod=ex1, size=50,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+enkf4 <- EnKF(y=dataEx2, mod=ex1, size=100,
+              GGfunction=GGfunction, FFfunction=FFfunction)
+
+plot(1:nc, turb, type="l", col= "black", #col=c(gray(level=.5)),
+     ylim=range(c(enkf1$m[121,], enkf2$m[121,], enkf3$m[121,], enkf4$m[121,])),
+     xlab="Node, i", ylab="Velocity (i)", main="t=2")
+lines(1:nc, enkf1$m[121,], lty=2, col="blue", lwd=1)
+lines(1:nc, enkf2$m[121,], lty=2, col="red", lwd=1)
+lines(1:nc, enkf3$m[121,], lty=2, col="darkgreen", lwd=1)
+lines(1:nc, enkf4$m[121,], lty=2, col="turquoise", lwd=1)
+points(c(57-50, 133-50), dataEx2[120,], col="coral", cex=1, pch = 20)
+legend("bottomleft", lty=c(1, 2, 2, 2),
+       col=c("black", "blue", "red", "darkgreen", "turquoise"),
+       legend=c("true state", "EnKf with 10 members",
+                "EnKf with 25 members", "EnKf with 50 members", "EnKf with 100 members"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+#y <- as.data.frame(Laminar$vel035[50:139])
+y <- as.data.frame(turb)
+
+#Error plot respecte de les simulades
+par(mfrow=c(1, 1))
+e1 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,1]-enkf1$m[i+1,]+inter)^2))
+e2 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,1]-enkf2$m[i+1,]+inter)^2))
+e3 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,1]-enkf3$m[i+1,]+inter)^2))
+e4 <- sapply(1:(nrow(y)-10), function (i) mean((y[i,1]-enkf4$m[i+1,]+inter)^2))
+
+rangeError <- range(cbind(e1, e2, e3, e4))
+plot(1:(nrow(y)-10), e1, type="l", lty=1, col="blue", log="y",
+     ylim=rangeError, ylab="Mean Squared Error", xlab="Time index, k")
+lines(1:(nrow(y)-10), e2, lty=1, col="red")
+lines(1:(nrow(y)-10), e3, lty=1, col="darkgreen")
+lines(1:(nrow(y)-10), e4, lty=1, col="turquoise")
+legend("topleft", lty=c(2, 2, 2),
+       col=c("blue", "red", "darkgreen", "turquoise"),
+       legend=c("EnKf with 10 members",
+                "EnKf with 20 members","EnKf with 25 members", "EnKf with 100 members"),
+       bty="n", y.intersp=1.2, cex=.7)
+
+## Error plot respecte de les experimentals! 
+
+enkfTurb <- enkf2
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:fig9.2}Laminar Flow velocity over longitudinal position adjusting a WN model to the data for different ensemble sizes. Configuration with diameter $0.04m$. ")}
+experimentalFilter  <- data.frame(x = index(turb), 
+                                  values = c(turb, enkf1$m[121,], enkf2$m[121,], 
+                                             enkf3$m[121,], enkf4$m[121,] ), 
+                        Data = c(rep("True State", 90), 
+                                 rep( "EnKf with 10 members", 90),
+                                 rep( "EnKf with 25 members",90), 
+                                 rep( "EnKf with 50 members", 90),
+                                 rep( "EnKf with 100 members", 90) ))
+ggplot(experimentalFilter, aes(x, values, col= Data))+geom_line(size=0.5)+
+  geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_color_manual(values= c( "coral","deepskyblue",  "green", "violet","navy")) +
+  ggtitle("Simulated and filtered velocity") + xlab("x (m)") + ylab("Velocity (m/s)")
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:enkfT1}EnKF filtered punctual velocity over time for the configuration of the turbulent flow, adjusting an WN model over the simulated data distribution. Configuration with diameter 0.04m.")}
+#with simulated distribution over longitudinal position adjusting a WN model to the data for different ensemble sizes.
+
+### tots els Enkf turbulents
+TubrulentFilter  <- data.frame(x = index(velA[61:181]), 
+                                  values = c(velA[59:179], velC[59:179], 
+                                             enkf2$m[62:182,57-50], 
+                                             enkf2$m[62:182,133-50],
+                                             enkfTWN$m[62:182,57-50],
+                                             enkfTWN$m[62:182,133-50]
+                                             #enkf3$m[62:182,57-50],
+                                             #enkf3$m[62:182,133-50]
+                                             #enkf2$m[62:182,57-50]+inter, 
+                                             #enkf2$m[62:182,133-50]+inter,
+                                             #enkf3$m[62:182,57-50]+inter,
+                                             #enkf3$m[62:182,133-50]+inter
+                                             ), 
+                        Data = c(rep("True velocity B", 121), 
+                                 rep( "True velocity D", 121),
+                                 rep( "EnKf B AR(2) ",121), 
+                                 rep( "EnKf D AR(2)", 121),
+                                 rep( "EnKf B WN", 121),
+                                 rep( "EnKf D WN", 121)))
+ggplot(TubrulentFilter, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c("turquoise","blue",  "coral", "red","navy", "darkred")) +
+  scale_linetype_manual(values=c("solid","solid","solid","solid", "dotdash", "dotdash"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Experimental and EnKF filtered velocity") + 
+  xlab("t (s)") + ylab("Velocity (m/s)")
+
+```
+
+```{r echo=FALSE, fig.width=6, fig.height=3, fig.cap= ("\\label{fig:enkfT1}EnKF filtered punctual velocity over time for the configuration of the turbulent flow, adjusting an WN model over the simulated data distribution. Configuration with diameter 0.04m.")}
+#with simulated distribution over longitudinal position adjusting a WN model to the data for different ensemble sizes.
+
+## turbulents
+experimentalFilter  <- data.frame(x = index(velA[61:181]), 
+                                  values = c(velA[59:179], velC[59:179], 
+                                             enkf2$m[62:182,57-50], 
+                                             enkf2$m[62:182,133-50],
+                                             enkf3$m[62:182,57-50],
+                                             enkf3$m[62:182,133-50]
+                                             #enkf2$m[62:182,57-50]+inter, 
+                                             #enkf2$m[62:182,133-50]+inter,
+                                             #enkf3$m[62:182,57-50]+inter,
+                                             #enkf3$m[62:182,133-50]+inter
+                                             ), 
+                        Data = c(rep("True velocity B", 121), 
+                                 rep( "True velocity D", 121),
+                                 rep( "EnKf with 25 members B",121), 
+                                 rep( "EnKf with 25 members D", 121),
+                                 rep( "EnKf with 50 members B", 121),
+                                 rep( "EnKf with 50 members D", 121)))
+ggplot(experimentalFilter, aes(x, values, col= Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c("turquoise", "coral","deepskyblue",  "deeppink","navy", "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dotdash","dotdash", "dotdash", "dotdash", "dashed", "dashed", "solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Experimental and EnKF filtered velocity") + 
+  xlab("t (s)") + ylab("Velocity (m/s)")
+
+```
+
+```{r include=FALSE}
+## comparació A tots
+CompFilterA  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velA[58:177], model.filteredAL1$f[59:178], 
+                                             A3mean[59:178],
+                                             PLa$velA037[58:177], 
+                                             PTu$velA06[58:177],
+                                             enkfTurb$m[60:179,57-50],
+                                             enkfWN$m[60:179,57-50],
+                                             enkfAR2$m[60:179,57-50]+mean(velA[61:180])
+                                             ), 
+                        Data = c(rep("True velocity A", 120), 
+                                 rep( "Filtered state KF laminar AR(3) with mean", 120),
+                                 rep( "Filtered state KF turbulent AR(2) with mean", 120),
+                                 rep("Simulated velocity laminar", 120), 
+                                 rep("Simulated velocity turbulent", 120), 
+                                 rep("Filtered state EnKF turbulent ARIMA(2,1,0)", 120),
+                                 rep("Filtered state EnKF WN", 120),
+                                 rep("Filtered state EnKF laminar AR(2,1,0) with mean", 120)
+                                 ) )
+ggplot(CompFilterA, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "blue", "navy", "turquoise", "coral", "red", "violet", "green", "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dotdash","dotdash", "dotdash", "dotdash", "dashed", "dashed", "solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Observed, simulated and filtered punctual velocity A") + 
+  xlab("Time (s)") + ylab("Velocity (m/s)")
+
+
+## comparació A tots (seleccionant els millors models)
+CompFilterA  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velA[58:177], 
+                                             enkfTurb$m[60:179,57-50],
+                                             #model.filteredAL1$f[59:178], 
+                                             A3mean[59:178],
+                                             #PLa$velA037[58:177], 
+                                             #PTu$velA06[58:177],
+                                             enkf3$m[60:179,57-50],
+                                             #enkfWN$m[60:179,57-50],
+                                             enkfAR2$m[60:179,57-50]+mean(velA[61:180])
+                                             ), 
+                        Data = c(rep("True velocity B", 120), 
+                                 rep("EnKF ARIMA(2,1,0)", 120),
+                                 #rep( "Filtered state KF laminar AR(3) with mean", 120),
+                                 rep( "KF tur AR(2)", 120),
+                                 #rep("Simulated velocity laminar", 120), 
+                                 #rep("Simulated velocity turbulent", 120), 
+                                 rep("EnKF WN", 120),
+                                 #rep("Filtered state EnKF laminar WN", 120),
+                                 rep("EnKF lam AR(2)", 120)
+                                 ) )
+ggplot(CompFilterA, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #scale_color_manual(values= c( "blue", "turquoise", "green", "violet", "darkred")) +
+  #scale_color_manual(values= c( "blue", "turquoise", "darkred","red","black")) +
+  scale_color_manual(values= c( "coral", "darkred","red", "turquoise" ,"navy")) +
+  scale_linetype_manual(values=c( "solid", "solid", "solid", "solid", "dotdash"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Observed, simulated and filtered punctual velocity A") + 
+  xlab("Time (s)") + ylab("Velocity (m/s)")
+
+### Els wn del turbulent i del laminar són iguals (estem aplicant un wn igualment, no cal possar-lo dos cops
+### als 2 mins ja no fa tanta diferència la condició inicial. Ens quedem amb el WN laminar per fer l'última)
+
+## La resta de diferències seran equivalents a les del wn anterior
+
+## Error tots
+errorA1 <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velA037[59:178]- velA[58:177])^2,
+                                             #(PTu$velA06[58:177]- velA[58:177])^2,
+                                             #(model.filteredAL1$f[59:178]-velA[58:177])^2,
+                                             (enkfTurb$m[60:179,57-50]- velA[58:177])^2,
+                                             (enkfWN$m[60:179,57-50]  - velA[58:177])^2,
+                                             (enkfAR2$m[60:179,57-50] + mean(velA) - velA[58:177])^2,
+                                             (A3mean[59:178]- velA[58:177])^2
+                                             ), 
+                        Data = c(rep("Simulated", 120), 
+                                 #rep("True state turbulent - simulated", 120),
+                                 rep( "EnKF ARIMA(2,1,0)", 120),
+                                 rep( "EnKF AR(2)", 120),
+                                 rep( "EnKF WN",120),
+                                 rep( "KF AR(2)",120) 
+                                 ))
+
+ggplot(errorA1, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  #scale_color_manual(values= c( "deeppink",  "blue","coral",  "navy", "darkred")) +
+  #scale_color_manual(values= c( "coral", "darkred","red", "blue" ,"navy")) +
+  scale_color_manual(values= c(  "darkred", "red", "turquoise", "blue" ,"navy")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #scale_linetype_manual(values=c("dotdash", "dotdash", "dotdash", "solid",  "dashed"))+
+  scale_linetype_manual(values=c("solid", "solid", "solid", "solid",  "dashed"))+
+  #ggtitle(" Mean squared error KF and EnKF filtered velocity A") + 
+  xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+
+
+## Error Enkf
+errorA1 <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velA037[59:178]- velA[58:177])^2,
+                                             #(PTu$velA06[58:177]- velA[58:177])^2,
+                                             #(model.filteredAL1$f[59:178]-velA[58:177])^2,
+                                             (enkfTurb$m[60:179,57-50]- velA[58:177])^2,
+                                             (enkfWN$m[60:179,57-50]  - velA[58:177])^2,
+                                             (enkfAR2$m[60:179,57-50] + mean(velA) - velA[58:177])^2
+                                             ), 
+                        Data = c(rep("True state laminar - simulated", 120), 
+                                 #rep("True state turbulent - simulated", 120),
+                                 rep( "True state - filtered state EnKF ARIMA(2,1,0)", 120),
+                                 rep( "True state - filtered state EnKF AR(2)", 120),
+                                 rep( "True state - filtered state EnKF WN",120) 
+                                 ))
+
+ggplot(errorA1, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c( "deeppink",  "blue", "navy", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash", "dotdash", "dotdash",  "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity A") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+## Error entre tots
+errorA <- data.frame(x = index(velA[61:180]), 
+                                  values = c((PLa$velA037[59:178]- velA[58:177])^2,
+                                             (A3mean[59:178]-velA[58:177])^2,
+                                             (enkf2$m[60:179,57-50]- velA[58:177])^2, 
+                                             (enkfWN$m[60:179,57-50]- velA[58:177])^2
+                                             ), 
+                        Data = c(rep("True state - simulated", 120), 
+                                 rep( "True state - filtered state KF", 120),
+                                 rep( "True state - filtered state EnKF AR(2)",120) , 
+                                 rep( "True state - filtered state EnKF WN",120) 
+                                 ))
+
+ggplot(errorA, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c("blue", "deeppink", "violet", "darkred")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash","dotdash", "dashed", "solid"))+
+  ggtitle(" Mean squared error KF and EnKF filtered velocity A") + xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+mean(( model.filteredAL$f[59:178]-velA[58:177])^2) # 0.0006765584
+mean(( model.filteredAL1$f[59:178]-velA[58:177])^2) # 0.0006768531
+
+mean((PLa$velA037[59:178]- velA[58:177])^2) ## 0.0001393601
+
+mean((enkfWN$m[60:179,57-50]- velA[58:177])^2) ## 0.0001048686
+
+## !!!
+mean((enkfTurb$m[60:179,57-50]- velA[58:177])^2) ##  0.000196165
+mean((enkfAR2$m[60:179,57-50] + mean(velA) - velA[58:177])^2) ## 0.0002815166
+
+## !!!
+mean((A3mean[59:178]- velA[58:177])^2) ## 2.645304e-05
+  
+## KF amb ar(2) és el més accurate!!                                           
+```
+
+```{r include=FALSE}
+## comparació C tots
+CompFilterC  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velC[58:177], 
+                                             model.filteredCL1$f[59:178], 
+                                             C3mean[59:178],
+                                             PLa$velC037[58:177], 
+                                             PTu$velC06[58:177],
+                                             enkfTurb$m[60:179,133-50],
+                                             enkfWN$m[60:179,133-50],
+                                             enkfAR2$m[60:179,133-50]+mean(velC[61:180])
+                                             ), 
+                        Data = c(rep("True velocity A", 120), 
+                                 rep( "Filtered state KF laminar AR(3) with mean", 120),
+                                 rep( "Filtered state KF turbulent AR(2) with mean", 120),
+                                 rep("Simulated velocity laminar", 120), 
+                                 rep("Simulated velocity turbulent", 120), 
+                                 rep("Filtered state EnKF turbulent ARIMA(2,1,0)", 120),
+                                 rep("Filtered state EnKF WN", 120),
+                                 rep("Filtered state EnKF laminar AR(2,1,0) with mean", 120)
+                                 ) )
+ggplot(CompFilterC, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  scale_color_manual(values= c( "blue", "navy", "turquoise", "coral", "red", "violet", "green", "darkred")) +
+  scale_linetype_manual(values=c("dotdash", "dotdash","dotdash", "dotdash", "dotdash", "dashed", "dashed", "solid"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  ggtitle("Observed, simulated and filtered punctual velocity A") + xlab("Time (s)") + ylab("Velocity (m/s)")
+
+
+## comparació C òptims
+CompFilterC1  <- data.frame(x = index(velA[60:179]), 
+                                  values = c(velC[58:177], 
+                                             enkfTurb$m[60:179,133-50],
+                                             #model.filteredAL1$f[59:178], 
+                                             C3mean[59:178],
+                                             #PLa$velA037[58:177], 
+                                             #PTu$velA06[58:177],
+                                             #enkf3$m[60:179,57-50],
+                                             enkfWN$m[60:179,133-50],
+                                             enkfAR2$m[60:179,133-50]+mean(velC[61:180])
+                                             ), 
+                        Data = c(rep("True velocity D", 120), 
+                                 rep("EnKF turbulent ARIRMA(2,1,0)", 120),
+                                 #rep( "Filtered state KF laminar AR(3) with mean", 120),
+                                 rep( "KF turbulent AR(2)", 120),
+                                 #rep("Simulated velocity laminar", 120), 
+                                 #rep("Simulated velocity turbulent", 120), 
+                                 rep("EnKF WN", 120),
+                                 #rep("Filtered state EnKF laminar WN", 120),
+                                 rep("EnKF laminar AR(2)", 120)
+                                 ) )
+ggplot(CompFilterC1, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #scale_color_manual(values= c( "blue", "navy", "coral", "deeppink", "darkred")) +
+  scale_color_manual(values= c( "coral", "darkred", "red", "turquoise","navy")) +
+  #scale_linetype_manual(values=c("dotdash", "dotdash", "dotdash", "dotdash", "solid"))+
+  scale_linetype_manual(values=c("solid", "solid", "solid", "solid",  "dashed"))+
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #ggtitle("Observed, simulated and filtered punctual velocity C") + 
+  xlab("Time (s)") + ylab("Velocity (m/s)")
+
+### Els wn del turbulent i del laminar són iguals (estem aplicant un wn igualment, no cal possar-lo dos cops
+### als 2 mins ja no fa tanta diferència la condició inicial. Ens quedem amb el WN laminar per fer l'última)
+
+## La resta de diferències seran equivalents a les del wn anterior
+
+## Error tots
+errorC1 <- data.frame(x = index(velA[61:180]), 
+                                  values = c(#(PLa$velC037[59:178]- velC[58:177])^2,
+                                             (PTu$velC06[58:177]- velC[58:177])^2,
+                                             #(model.filteredAL1$f[59:178]-velA[58:177])^2,
+                                             (enkfTurb$m[60:179,133-50]- velC[58:177])^2,
+                                             (enkfWN$m[60:179,133-50]  - velC[58:177])^2,
+                                             (enkfAR2$m[60:179,133-50] + mean(velC) - velC[58:177])^2,
+                                             (C3mean[59:178]- velC[58:177])^2
+                                             ), 
+                        Data = c(#rep("True state laminar - simulated", 120), 
+                                 rep("Turbulent simulated", 120),
+                                 rep( "EnKF ARIMA(2,1,0)", 120),
+                                 rep( "EnKF AR(2)", 120),
+                                 rep( "EnKF WN",120),
+                                 rep( "KF AR(2)",120) 
+                                 ))
+
+ggplot(errorC1, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  #scale_color_manual(values= c( "deeppink",  "blue","coral", "violet",  "navy")) +
+  scale_color_manual(values= c( "darkred", "red", "deeppink",  "blue", "navy")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  #scale_linetype_manual(values=c("dotdash", "dotdash", "dotdash", "dotdash", "solid",  "solid"))+
+  scale_linetype_manual(values=c("dotdash", "dotdash", "dotdash", "solid", "dashed"))+
+  #ggtitle(" Mean squared error KF and EnKF filtered velocity A") + 
+  xlab("t (s)") + ylab("Velocity (m/s)")
+
+
+
+
+## Error only filters
+errorC2 <- data.frame(x = index(velA[61:180]), 
+                                  values = c(#(PLa$velA037[59:178]- velA[58:177])^2,
+                                             #(PTu$velA06[58:177]- velA[58:177])^2,
+                                             #(model.filteredAL1$f[59:178]-velA[58:177])^2,
+                                             (enkfTurb$m[60:179,133-50]- velC[58:177])^2,
+                                             (enkfWN$m[60:179,133-50]  - velC[58:177])^2,
+                                             (enkfAR2$m[60:179,133-50] + mean(velC) - velC[58:177])^2,
+                                             (C3mean[59:178]- velC[58:177])^2
+                                             ), 
+                        Data = c(#rep("True state laminar - simulated", 120), 
+                                 #rep("True state turbulent - simulated", 120),
+                                 rep( "EnKF ARIMA(2,1,0)", 120),
+                                 rep( "EnKF AR(2)", 120),
+                                 rep( "EnKF WN",120),
+                                 rep( "KF AR(2)",120) 
+                                 ))
+
+ggplot(errorC2, aes(x, values, col= Data, linetype=Data))+geom_line(size=0.5)+
+  #geom_point(data= exp2, aes(x = V1, y=V2), color= "deeppink")+
+  scale_color_manual(values= c( "darkred","red", "turquoise", "blue")) +
+  theme(panel.background = element_rect(fill = "white", colour = "grey50"))+
+  scale_linetype_manual(values=c("dotdash", "dotdash", "dotdash",  "solid"))+
+  #ggtitle(" Mean squared error KF and EnKF filtered velocity A") + 
+  xlab("t (s)") + ylab("Velocity (m/s)")
+
+mean((PLa$velC037[59:178]- velC[58:177])^2) ## 0.003376758
+mean((PTu$velC06[58:177]- velC[58:177])^2) ## 0.0126259
+
+mean(( model.filteredCL$f[59:178]-velC[58:177])^2) # 0.002804146
+mean(( model.filteredCL1$f[59:178]-velC[58:177])^2) # 0.001576669
+mean((enkfWN$m[60:179,133-50]- velC[58:177])^2) ## 0.0003632295
+
+mean((enkfTurb$m[60:179,133-50]- velC[58:177])^2) ##  0.0003691499
+mean((enkfAR2$m[60:179,133-50] + mean(velC) - velC[58:177])^2) ##  0.0004689085
+mean((C3mean[59:178]- velC[58:177])^2) ## 4.543115e-05
+  
+## KF amb ar(2) és el més accurate!!    
+
+## provar més KF pot ser!!?
+
+## millorar algoritmes EnKF
+```
